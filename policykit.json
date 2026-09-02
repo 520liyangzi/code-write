@@ -7,6 +7,8 @@
     "review": ".policy-work/REVIEW_ME.md",
     "approved_rules": ".policy-work/approved-rules.json",
     "search_index": ".policy-work/search-index.db",
+    "ai_cache": ".policy-work/ai-enrichment-cache.json",
+    "embedding_cache": ".policy-work/embedding-cache.json",
     "global_block": ".policy-work/GLOBAL_MD_BLOCK.md",
     "receipts_dir": ".policy-work/receipts",
     "audit_dir": ".policy-work/audit"
@@ -25,6 +27,36 @@
   "review": {
     "global_core_limit": 40,
     "activate_only_approved": true
+  },
+  "ai": {
+    "provider": "disabled",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "timeout_seconds": 30,
+    "required": false,
+    "max_input_chars": 16000,
+    "llm": {
+      "enabled": false,
+      "model": "",
+      "batch_size": 12
+    },
+    "embedding": {
+      "enabled": false,
+      "model": "text-embedding-3-small",
+      "dimensions": null,
+      "batch_size": 64,
+      "semantic_weight": 0.4,
+      "min_similarity": 0.28
+    }
+  },
+  "database": {
+    "enabled": false,
+    "adapter": "sqlite",
+    "url_env": "POLICYKIT_DATABASE_URL",
+    "url": "",
+    "required": false,
+    "custom_factory": "",
+    "options": {}
   },
   "codegraph": {
     "enabled": false,

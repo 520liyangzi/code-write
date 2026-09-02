@@ -17,6 +17,16 @@ from .model import PolicyRule, SourceRef, make_rule_id
 
 
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+_RULE_HEADING_RE = re.compile(
+    r"^\s{0,3}(#{1,6})\s+"
+    r"(?:(\d+(?:\.\d+)*)\s+)?"
+    r"([A-Z][A-Z0-9_-]*(?:\.[A-Z0-9_-]+){1,})\s+"
+    r"(.+?)\s*#*\s*$"
+)
+_STRUCTURED_FIELD_RE = re.compile(
+    r"^\s*(?:\*\*)?\s*【\s*(级别|描述|反例|正例)\s*】\s*"
+    r"(?:\*\*)?\s*[:：]?\s*(.*?)\s*$"
+)
 _LIST_RE = re.compile(
     r"^\s*(?:[-+*]|\d+[.)、]|[一二三四五六七八九十]+[、.)])\s+(.*)$"
 )
@@ -143,6 +153,18 @@ class _Block:
     list_item: bool = False
 
 
+@dataclass(slots=True)
+class _StructuredRuleBlock:
+    rule_code: str
+    number: str
+    title: str
+    parent_section: str
+    raw: str
+    fields: dict[str, str]
+    line_start: int
+    line_end: int
+
+
 def _strip_markdown(value: str) -> str:
     value = unicodedata.normalize("NFKC", value)
     value = re.sub(r"<!--.*?-->", " ", value)
@@ -153,6 +175,112 @@ def _strip_markdown(value: str) -> str:
     value = re.sub(r"^\s*>+\s?", "", value)
     value = re.sub(r"\s*\|\s*", "；", value).strip("； ")
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _strip_field_markdown(value: str) -> str:
+    """Clean prose while preserving useful line and code boundaries."""
+
+    lines: list[str] = []
+    in_fence = False
+    for raw_line in value.strip().splitlines():
+        if _FENCE_RE.match(raw_line):
+            in_fence = not in_fence
+            continue
+        cleaned = raw_line.rstrip() if in_fence else _strip_markdown(raw_line)
+        if cleaned or (lines and lines[-1]):
+            lines.append(cleaned)
+    return "\n".join(lines).strip()
+
+
+def _iter_structured_rule_blocks(markdown: str) -> Iterable[_StructuredRuleBlock]:
+    """Yield common Chinese standard blocks as one complete policy unit.
+
+    Documents commonly encode a rule in the heading and put its rationale and
+    examples in labelled fields.  Treating the heading as an independent
+    sentence loses most of the rule and was the main cause of one-word/one-line
+    candidates.
+    """
+
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    starts: list[tuple[int, re.Match[str], str]] = []
+    headings: list[tuple[int, int]] = []
+    heading_stack: list[tuple[int, str]] = []
+    in_fence = False
+    fence_marker = ""
+
+    for index, line in enumerate(lines):
+        fence_match = _FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)[0]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+                fence_marker = ""
+            continue
+        if in_fence:
+            continue
+        heading = _HEADING_RE.match(line)
+        if not heading:
+            continue
+        level = len(heading.group(1))
+        headings.append((index, level))
+        while heading_stack and heading_stack[-1][0] >= level:
+            heading_stack.pop()
+        rule_heading = _RULE_HEADING_RE.match(line)
+        parent = _section_text(heading_stack)
+        if rule_heading:
+            starts.append((index, rule_heading, parent))
+        heading_stack.append((level, _strip_markdown(heading.group(2))))
+
+    for position, (start, match, parent) in enumerate(starts):
+        next_rule = (
+            starts[position + 1][0]
+            if position + 1 < len(starts)
+            else len(lines)
+        )
+        heading_level = len(match.group(1))
+        next_section = next(
+            (
+                index
+                for index, level in headings
+                if index > start and level <= heading_level
+            ),
+            len(lines),
+        )
+        end = min(next_rule, next_section)
+        field_values: dict[str, list[str]] = {
+            "级别": [],
+            "描述": [],
+            "反例": [],
+            "正例": [],
+        }
+        current = "描述"
+        for line in lines[start + 1 : end]:
+            field = _STRUCTURED_FIELD_RE.match(line)
+            if field:
+                current = field.group(1)
+                inline = field.group(2).strip()
+                if inline:
+                    field_values[current].append(inline)
+                continue
+            field_values[current].append(line)
+        fields = {
+            key: "\n".join(value).strip()
+            for key, value in field_values.items()
+        }
+        raw = "\n".join(lines[start:end]).strip()
+        yield _StructuredRuleBlock(
+            rule_code=match.group(3).strip(),
+            number=(match.group(2) or "").strip(),
+            title=_strip_markdown(match.group(4)),
+            parent_section=parent,
+            raw=raw,
+            fields=fields,
+            line_start=start + 1,
+            line_end=end,
+        )
 
 
 def _section_text(stack: list[tuple[int, str]]) -> str:
@@ -323,7 +451,7 @@ def _iter_blocks(markdown: str) -> Iterable[_Block]:
 def _normative_parts(text: str) -> list[str]:
     """Keep coherent candidates while splitting very long prose paragraphs."""
 
-    if len(text) <= 240:
+    if len(text) <= 800:
         return [text] if _NORMATIVE_RE.search(text) else []
     parts = re.split(r"(?<=[。！？!?；;])\s*", text)
     return [part.strip() for part in parts if _NORMATIVE_RE.search(part)]
@@ -381,19 +509,153 @@ def _enforcement_candidates(statement: str) -> tuple[str, ...]:
 
 def _trigger_terms(raw: str, statement: str) -> tuple[str, ...]:
     terms: list[str] = []
-    terms.extend(re.findall(r"`([^`]{1,100})`", raw))
+    # Strip fenced-code delimiters before parsing inline code. Otherwise a
+    # closing/opening pair of triple backticks can become one giant trigger.
+    trigger_source = re.sub(
+        r"^\s*(?:```+|~~~+)[^\n]*$",
+        "",
+        raw,
+        flags=re.MULTILINE,
+    )
+    terms.extend(
+        re.findall(r"(?<!`)`([^`\n]{1,100})`(?!`)", trigger_source)
+    )
     terms.extend(
         re.findall(
             r"@[A-Z][A-Za-z0-9_]*|\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\b|"
             r"\b[A-Za-z_$][\w$]*(?:\.java|\.xml|\.yml|\.yaml|\.properties)\b",
-            raw,
+            trigger_source,
         )
     )
-    for category, keywords in _CATEGORY_TERMS.items():
-        del category
-        terms.extend(term for term in keywords if term.lower() in statement.lower())
+    terms.extend(
+        value.rstrip("(")
+        for value in re.findall(
+            r"\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\s*\(",
+            trigger_source,
+        )
+    )
     cleaned = (_strip_markdown(term) for term in terms)
     return tuple(dict.fromkeys(term for term in cleaned if 1 < len(term) <= 100))
+
+
+def _retrieval_hints(text: str) -> tuple[str, ...]:
+    """Add stable Java intent aliases for lexical fallback retrieval."""
+
+    groups: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+        (("小驼峰", "驼峰命名"), ("camelCase", "变量命名", "字段命名", "局部变量")),
+        (("javadoc", "顶层public类", "顶层 public 类"),
+         ("public class", "public interface", "public enum", "public record", "类注释")),
+        (("反序列化",),
+         ("ObjectInputStream", "readObject", "ObjectMapper.readValue", "JSON.parseObject", "外部数据")),
+        (("格式化字符串", "string.format"),
+         ("String.format", "Formatter", "format", "占位符", "外部输入", "请求参数")),
+        (("外部数据", "外部输入", "用户输入"),
+         ("request.getParameter", "不可信数据", "请求参数", "用户可控")),
+    )
+    folded = unicodedata.normalize("NFKC", text).casefold().replace(" ", "")
+    hints: list[str] = []
+    for needles, values in groups:
+        if any(needle.casefold().replace(" ", "") in folded for needle in needles):
+            hints.extend(values)
+    return tuple(dict.fromkeys(hints))
+
+
+def _direct_triggers(text: str) -> tuple[str, ...]:
+    """Return only high-precision code signals safe for direct injection."""
+
+    folded = unicodedata.normalize("NFKC", text).casefold().replace(" ", "")
+    triggers: list[str] = []
+    if "javadoc" in folded and any(
+        value in folded for value in ("顶层public类", "publicclass")
+    ):
+        triggers.extend(
+            ("public class", "public interface", "public enum", "public record")
+        )
+    if "反序列化" in folded:
+        triggers.extend(
+            (
+                "ObjectInputStream",
+                "readObject",
+                "ObjectMapper.readValue",
+                "JSON.parseObject",
+            )
+        )
+    if "格式化字符串" in folded or "string.format" in folded:
+        triggers.extend(("String.format", "Formatter"))
+    return tuple(dict.fromkeys(triggers))
+
+
+def _structured_severity(level: str, title: str, category: str) -> str:
+    normalized = _strip_markdown(level).casefold()
+    if any(value in normalized for value in ("建议", "推荐", "参考", "advisory")):
+        return "advisory"
+    return _suggest_severity(title, category)
+
+
+def _structured_rule(
+    block: _StructuredRuleBlock,
+    *,
+    source_name: str,
+    scope: str,
+) -> PolicyRule:
+    description = _strip_field_markdown(block.fields.get("描述", ""))
+    negative_example = _strip_field_markdown(block.fields.get("反例", ""))
+    positive_example = _strip_field_markdown(block.fields.get("正例", ""))
+    level = _strip_markdown(block.fields.get("级别", ""))
+    complete_text = "\n".join(
+        value
+        for value in (
+            block.title,
+            description,
+            negative_example,
+            positive_example,
+        )
+        if value
+    )
+    category = _classify_category(source_name, block.parent_section, complete_text)
+    hints = _retrieval_hints(complete_text)
+    direct_triggers = _direct_triggers(complete_text)
+    triggers = tuple(
+        dict.fromkeys((*_trigger_terms(block.raw, complete_text), *hints))
+    )
+    heading = " ".join(
+        value for value in (block.number, block.rule_code, block.title) if value
+    )
+    section = " / ".join(
+        value for value in (block.parent_section, heading) if value
+    )
+    return PolicyRule(
+        id=block.rule_code,
+        title=block.title,
+        statement=block.title,
+        source=SourceRef(
+            document=source_name,
+            section=section,
+            line_start=block.line_start,
+            line_end=block.line_end,
+            quote=block.raw,
+        ),
+        scope=scope,
+        category=category,
+        severity=_structured_severity(level, block.title, category),
+        enforcement_candidates=_enforcement_candidates(complete_text),
+        trigger_terms=triggers,
+        tags=tuple(dict.fromkeys((category, "structured-rule", block.rule_code))),
+        status="pending_review",
+        confidence=0.96 if description else 0.9,
+        metadata={
+            "extractor": "markdown-structured-v2",
+            "structured_format": True,
+            "rule_number": block.number,
+            "level": level,
+            "description": description,
+            "negative_example": negative_example,
+            "positive_example": positive_example,
+            "retrieval_hints": list(hints),
+            "code_signals": list(_trigger_terms(block.raw, complete_text)),
+            "direct_triggers": list(direct_triggers),
+        },
+    )
 
 
 def _title(section: str, statement: str) -> str:
@@ -439,7 +701,32 @@ class MarkdownPolicyExtractor:
         seen_statements: set[str] = set()
         effective_scope = scope or self.scope
 
+        structured = list(_iter_structured_rule_blocks(markdown))
+        covered_lines: set[int] = set()
+        seen_ids: set[str] = set()
+        for block in structured:
+            rule = _structured_rule(
+                block,
+                source_name=source_name,
+                scope=effective_scope,
+            )
+            if rule.id in seen_ids:
+                rule.id = make_rule_id(
+                    source_name,
+                    rule.source.section,
+                    rule.statement,
+                    prefix=rule.id,
+                )
+            seen_ids.add(rule.id)
+            rules.append(rule)
+            covered_lines.update(range(block.line_start, block.line_end + 1))
+
         for block in _iter_blocks(markdown):
+            if any(
+                line in covered_lines
+                for line in range(block.line_start, block.line_end + 1)
+            ):
+                continue
             for statement in _normative_parts(block.text):
                 normalized = re.sub(r"\s+", "", statement).casefold()
                 if len(normalized) < 5 or normalized in seen_statements:
@@ -484,6 +771,9 @@ class MarkdownPolicyExtractor:
                     confidence=_confidence(block, statement),
                     metadata={"extractor": "markdown-v1"},
                 )
+                if rule.id in seen_ids:
+                    continue
+                seen_ids.add(rule.id)
                 rules.append(rule)
         return rules
 

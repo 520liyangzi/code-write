@@ -468,7 +468,13 @@ class PolicyChecker:
             if not applicable_specs:
                 continue
             score = 1
-            terms = _strings(rule.get("trigger_terms")) + _strings(rule.get("tags"))
+            metadata = _mapping(rule.get("metadata"))
+            if "direct_triggers" in metadata:
+                terms = _strings(metadata.get("direct_triggers"))
+            else:
+                terms = _strings(rule.get("trigger_terms")) + _strings(
+                    rule.get("tags")
+                )
             matched_terms = [term for term in terms if term.lower() in haystack]
             score += 4 * len(matched_terms)
             has_path_scope = any(_rule_paths(rule, spec)[0] for spec in applicable_specs)
@@ -482,7 +488,6 @@ class PolicyChecker:
             has_deterministic_checker = any(
                 _text(spec.get("type")) != "ai_review" for spec in applicable_specs
             )
-            metadata = _mapping(rule.get("metadata"))
             if not (
                 matched_terms
                 or has_path_scope

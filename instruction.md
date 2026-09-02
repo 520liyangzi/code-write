@@ -18,11 +18,11 @@
 
 ```mermaid
 flowchart LR
-    A[公司/部门/项目 Markdown] --> B[prepare 提取候选]
-    B --> C[AI 生成可靠 checker 草案]
+    A[公司/部门/项目 Markdown] --> B[结构化解析完整规则]
+    B --> C[可选 LLM 生成检索提示]
     C --> D[REVIEW_ME.md + review_hash]
     D -->|你亲自勾选| E[activate 正式规则库]
-    E --> F[统一运行时入口: SQLite/BM25 + checker 适用性]
+    E --> F[SQLite: BM25 + 可选向量 + checker]
     E --> G[全局 MD 少量核心红线]
     F --> H[写前一次性 receipt]
     H --> I[Edit/Write]
@@ -70,7 +70,10 @@ flowchart LR
 - 只有你在 `REVIEW_ME.md` 中明确批准的规则才会激活。
 - `prepare` 自动抽取的是候选规则；抽取结果可能有歧义，必须人工审阅。
 - `prepare` 会建议规则更适合静态检查、路径检查、配套变更检查还是 AI review，但不会把自然语言猜成可执行正则。等你提供真实规范后，由 Codagent/本项目维护者把能够可靠判断的条款编译成 `metadata.checks` 草案，再重新生成审阅文件；没有具体 checker 配置的规则一律按 AI review 处理，不能伪装成确定性检查。
-- 默认使用结构化标签和本地全文索引，不要求 Embedding 模型或向量数据库。主动 JSON 回执去掉重复规则对象，并默认限制在 8000 字符以内。
+- `规则编号 + 【级别】/【描述】/【反例】/【正例】` 会被解析为一条完整规则，字段和代码样例都会参与检索并随命中结果返回，不再把标题拆成一个短词候选。
+- 默认使用本地 BM25，不要求联网。可选 OpenAI/OpenAI-compatible LLM 只生成检索意图、别名和代码信号，可选 Embedding 与 BM25 融合；两者都按规则内容哈希缓存，未变化的规则不会重复生成。
+- AI 不会批准规则、改写权威正文或自动创造确定性 checker。主动 JSON 回执去掉重复规则对象，并默认限制在 8000 字符以内。
+- 激活后可选把完整规则和向量镜像到本地 SQLite；`RuleDatabasePort`/`custom_factory` 给 MySQL、PostgreSQL 或向量库适配器预留了接口。正式运行时仍以经过 `bundle_id` 校验的 JSON + 索引为准。
 - CodeGraph 完全可选。本工具不会重新生成你公司的 CodeGraph 索引，也不会因为 CodeGraph 不可用而阻止编码。
 - 公司、部门、项目三个层级目前没有“项目规则自动覆盖公司规则”的隐式优先级。若多个层级存在冲突，检索可能同时返回；必须在审批阶段拒绝错误条款、补全适用边界或让规范负责人确认，冲突未解决不要激活。
 - `examples/test-policies/` 全是虚构测试数据，默认不导入、不激活，禁止当作公司规则使用。
@@ -131,10 +134,10 @@ code-write/
 
 1. 选择公司级、部门级或项目级范围，拖入一个或多个 `.md/.markdown` 文件；成功后分别写入 `policy-sources/company`、`policy-sources/department` 或 `policy-sources/project`。同名文件不会被静默覆盖。
 2. 点击“生成候选规则”，得到与命令行相同的 `candidates.json` 和 `REVIEW_ME.md`。
-3. 在“候选规则审批台”查看来源原文、抽取正文、严重度、置信度和 checker 草案，逐条批准、修改后接受、拒绝或暂缓。
+3. 在“候选规则审批台”查看来源原文、级别、完整描述、反例、正例、严重度、置信度和 checker 草案。可逐条处理，也可先筛选再一次批量批准当前待处理项；批量操作不会覆盖已有决定。
 4. 页面每次保存都会原子更新真实 `REVIEW_ME.md`；候选内容发生变化时，旧页面的 `review_hash` 会失效；同一规则若已被另一个页面更新，旧的 `decision_hash` 也会阻止后保存者静默覆盖。
 5. 确认版本号后激活。只有批准或修改后接受的规则进入 `approved-rules.json` 和 `search-index.db`；两者带同一 `bundle_id`，不一致时页面、命令行和 Hook 都会 fail-closed。
-6. 在“索引检索沙盒”输入开发意图、目标 Java 文件和可选代码片段。页面调用与 Codagent Hook 相同的运行时入口，在已激活的 SQLite/BM25 正式索引上合并文本相关性与 path/checker 适用性，并查看分数、命中原因和规范来源。
+6. 在“索引检索沙盒”输入开发意图、目标 Java 文件和可选代码片段。页面调用与 Codagent Hook 相同的运行时入口，在已激活索引上合并 BM25、可选向量相似度与 path/checker 适用性，并查看分数、命中原因、级别、描述和正反例。
 7. “原始 REVIEW_ME”页签可查看和复制底层 Markdown，便于 Git diff、归档或脱离页面继续人工审阅。
 
 页面完全复用命令行的抽取、审批哈希、checker 校验、激活和运行时召回代码；它不是另一套规则库。所有写接口只接受本页面发送的 JSON 请求，服务只允许本机回环访问，也不会连接外部 CDN。
@@ -277,6 +280,31 @@ policy-sources/
 
 不要为了迎合抽取器而删掉原规范中的例外条件；条件和例外恰恰决定规则是否会误报。很长的章节可以拆成多个 Markdown 文件，但要保留清晰标题和权威来源信息。
 
+#### 推荐的结构化规则格式
+
+下面这种格式会作为一个整体解析，规则 ID 原样保留；描述和正反例不会再被丢掉：
+
+````markdown
+### 3.12.3 G.EDV.02 禁止直接使用外部数据构造格式化字符串
+
+**【级别】** 要求
+
+**【描述】**
+格式模板必须由程序定义，外部数据只能作为待格式化参数。
+
+**【反例】**
+```java
+String.format(request.getParameter("format"), value);
+```
+
+**【正例】**
+```java
+String.format("%s", value);
+```
+````
+
+仓库中的 `examples/test-policies/Java结构化编码规范-仅测试.md` 提供了四条完整测试规则，分别覆盖小驼峰变量、顶层 public 类型 Javadoc、外部数据反序列化和外部格式化字符串。它仅用于测试，不能作为公司规则激活。
+
 ### 第二步：生成审阅文件
 
 使用默认 `policy-sources/`：
@@ -289,6 +317,12 @@ policy-sources/
 
 ```powershell
 .\scripts\policy.ps1 prepare --source "D:\company-java-policies"
+```
+
+重复执行会自动保留内容未变化规则的决定。如果 CLI 检测到已批准、修改、拒绝或带备注的规则已变化/删除，会先退出而不覆盖审阅文件；核对差异并确认丢弃这些过期决定后，再显式运行：
+
+```powershell
+.\scripts\policy.ps1 prepare --reset-decisions
 ```
 
 主要产物位于：
@@ -321,7 +355,7 @@ policy-sources/
 
 同一规则多选，或选择“修改后接受”却没有填写内容时，激活会安全失败，不会猜测你的意思。没有勾选的规则按“暂不处理”保留，不会进入正式规则库。
 
-每个审阅块都带有候选正文、范围、严重度和 checker 草案的 `review_hash`。生成审阅文件后如果 `candidates.json` 又发生变化，旧勾选会失效，必须重新运行 `review` 并重新审阅；这能防止“你勾选后内容被悄悄替换”。激活前还会校验 checker 类型、必填字段和正则语法，配置错误时不会降级后偷偷执行。
+每个审阅块都带有候选正文、范围、严重度和 checker 草案的 `review_hash`。再次执行 `prepare` 或 `review` 时，内容指纹未变化的规则会自动保留原决定、修改正文和备注；新增规则保持待处理。只有规则被修改或删除时，对应旧决定才会失效并要求一次确认，这能防止“你勾选后内容被悄悄替换”，同时避免每次全量重选。激活前还会校验 checker 类型、必填字段和正则语法，配置错误时不会降级后偷偷执行。
 
 如果这次由 Codagent 使用 `java-policy-authoring` Skill 为可靠条款生成了 checker 草案，它会先运行：
 
@@ -398,6 +432,72 @@ authoring 完成后，`candidates.json` 的 `metadata.checks` 会出现草案，
 只有明确批准或按要求修改后批准的规则会进入 `approved-rules.json`。
 
 `GLOBAL_MD_BLOCK.md` 不会塞入全部正式规则。默认只从已批准规则中选择：显式标记 `metadata.global_core: true` 的规则，以及没有显式排除且属于非项目级的 `blocker`；默认最多 40 条。普通规则仍在正式索引中按需检索。把标记块合并进 Codagent 前必须人工阅读，确认没有把范围过窄或有例外的条款放进全局上下文。
+
+### 可选：启用大模型检索增强与向量
+
+推荐保留“确定性结构化解析 + BM25”为基础，再把大模型用于低频建索引，而不是让大模型替你审批或改写规则：
+
+1. `prepare` 时，大模型只为新增或变化规则生成 `retrieval_intent`、别名、代码信号和触发词；结果缓存在 `.policy-work/ai-enrichment-cache.json`。
+2. `activate` 时，把完整的 title、规则正文、描述、正反例和检索提示一起 Embedding；结果缓存在 `.policy-work/embedding-cache.json`。
+3. 日常搜索把任务、文件路径和代码片段生成一个查询向量，与 BM25 分数融合。API 不可用且 `required=false` 时自动回退 BM25；规则正文和人工审批不受影响。
+
+先在当前 PowerShell 会话设置密钥，不要把密钥写入 `policykit.json` 或提交到 Git：
+
+```powershell
+$env:OPENAI_API_KEY = "你的密钥"
+```
+
+再修改 `policykit.json` 的 `ai` 部分：
+
+```json
+{
+  "ai": {
+    "provider": "openai",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "required": false,
+    "llm": {
+      "enabled": true,
+      "model": "<填写当前账号可用的文本模型>",
+      "batch_size": 12
+    },
+    "embedding": {
+      "enabled": true,
+      "model": "text-embedding-3-small",
+      "dimensions": null,
+      "batch_size": 64,
+      "semantic_weight": 0.4,
+      "min_similarity": 0.28
+    }
+  }
+}
+```
+
+接公司网关或本地 OpenAI-compatible 服务时，把 `provider` 改成 `openai-compatible`，并设置 `POLICYKIT_OPENAI_BASE_URL` 或 `base_url`。接口使用 `/responses` 和 `/embeddings`。修改模型、维度或规则内容只会为对应缓存未命中的部分重新生成；新增规则不需要重建旧规则向量。
+
+### 可选：连接本地数据库
+
+内置 SQLite 适配器会在每次成功激活时镜像完整规则 JSON 和可用向量：
+
+```powershell
+$env:POLICYKIT_DATABASE_URL = "sqlite:///.policy-work/local-policy.db"
+```
+
+```json
+{
+  "database": {
+    "enabled": true,
+    "adapter": "sqlite",
+    "url_env": "POLICYKIT_DATABASE_URL",
+    "url": "",
+    "required": false,
+    "custom_factory": "",
+    "options": {}
+  }
+}
+```
+
+相对路径以 Policy Kit 根目录为基准。需要接 MySQL、PostgreSQL、Milvus 或其他本地服务时，将 `adapter` 设为 `custom`，并把 `custom_factory` 配成 `你的模块:工厂函数`。工厂函数接收 `url` 和 `options`，返回实现 `sync_bundle(rules, policy_version, bundle_id, embeddings)` 的对象；这样无需修改抽取、审批和激活主流程。`required=true` 表示同步失败时激活接口明确报错，默认 `false` 则保留本地正式索引并返回警告。
 
 ### 第五步（推荐）：导出手工部署包
 
@@ -757,8 +857,8 @@ company-java-2026.09-v1
 
 1. 若是新增文件，在“导入规范并审阅候选”中选择正确层级后上传。若是替换同名文件，页面会拒绝覆盖；先把旧版备份到 `policy-sources` 之外，再在文件资源管理器中明确替换 `policy-sources\company`、`policy-sources\department` 或 `policy-sources\project` 下的旧文件。页面当前没有删除/覆盖入口。
 2. 不要把新版改名为 `Java规范-v2.md` 后与旧版一起保留在规范源目录，否则两版会被同时抽取，产生重复或冲突规则。
-3. 点击“生成候选规则”。如果已有审批决定或备注，页面会要求确认重置。重新生成候选**不会修改当前正在使用的正式索引**，所以此时线上旧版本仍然有效。
-4. 新 `REVIEW_ME.md` 是一次完整的新审批批次，原决定不会自动继承。所有希望在新版本继续生效的旧规则都必须重新批准；没有重新批准的规则不会进入下一次激活结果。
+3. 点击“生成候选规则”。内容指纹完全一致的规则会自动继承审批决定、修改正文和备注；新增规则保持待处理。只有已决定规则发生变化或被删除时，页面才会列出无法继承的决定并要求一次确认。重新生成候选**不会修改当前正在使用的正式索引**，所以此时线上旧版本仍然有效。
+4. 在候选台把筛选条件设为“待处理”，集中处理新增或变化规则；确认范围一致时可使用“批量批准当前待处理项”。已有决定不会被批量覆盖。
 5. 保存全部决定后，比较“旧版本批准数、新版本批准数、新增数、删除数和暂缓数”。数量异常时先查明原因，不要激活。
 6. 填写新策略版本并激活。只有这一步成功后，源码仓库的正式索引才切换为新版本。
 7. 用至少三条已知查询做回归：一条应命中、一条不应命中、一条依赖文件路径/checker 直接适用。
@@ -770,7 +870,7 @@ company-java-2026.09-v1
 
 ```powershell
 .\scripts\policy.ps1 prepare
-# 在新的 REVIEW_ME.md 中重新批准所有希望保留的规则
+# 只审阅新增或变化规则；未变化规则会保留原决定
 .\scripts\policy.ps1 activate `
   --review ".policy-work\REVIEW_ME.md" `
   --policy-version "company-java-2026.09-v1"
@@ -889,7 +989,9 @@ company-java-2026.09-v1
 
 ### 需要 Embedding 模型吗
 
-第一版不需要。真实规范导入后如果本地全文检索对抽象表述明显漏召回，再评估公司批准的本地 Embedding 模型；这不影响当前安装包和审阅流程。
+不是必需。默认 BM25 已支持完整结构化字段、中文二/三元词组、Java 标识符和代码 API 信号；对于“代码写法与规范措辞差异很大”的抽象场景，再启用 `ai.embedding`。规则向量只在激活时对新增/变化内容生成，日常每次查询只生成一个查询向量。若网络、密钥或模型不可用且 `ai.required=false`，页面、CLI 和 Hook 会明确回退到 BM25；设为 `true` 时则 fail-closed。
+
+如果启用后页面仍显示 `SQLITE` 而不是 `SQLITE-HYBRID`，先检查 `OPENAI_API_KEY`、`ai.provider`、`ai.embedding.enabled` 和模型名，然后重新执行 `activate`，确保正式索引的 `embedding_count` 大于 0。
 
 ## 10. 最终上线清单
 

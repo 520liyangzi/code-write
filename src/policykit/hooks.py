@@ -26,6 +26,7 @@ import time
 from typing import Any, IO, Iterable, Mapping
 from uuid import uuid4
 
+from .ai import AISettings, PolicyAIError, embed_runtime_query
 from .audit import AuditTrail, safe_session_id
 from .checkers import CheckResult, PolicyChecker
 from .model import PolicyRule
@@ -256,6 +257,9 @@ def _search_cards(
     limit: int,
     expected_policy_version: str,
     expected_bundle_id: str,
+    query_embedding: Iterable[float] | None = None,
+    semantic_weight: float = 0.4,
+    min_similarity: float = 0.28,
 ) -> list[dict[str, Any]]:
     """Retrieve only from the activated index and merge checker applicability."""
 
@@ -268,6 +272,13 @@ def _search_cards(
         limit=limit,
         expected_policy_version=expected_policy_version,
         expected_bundle_id=expected_bundle_id or None,
+        query_embedding=(
+            tuple(float(value) for value in query_embedding)
+            if query_embedding is not None
+            else None
+        ),
+        semantic_weight=semantic_weight,
+        min_similarity=min_similarity,
     )
 
 
@@ -546,6 +557,7 @@ def _format_context(
     *,
     policy_version: str,
     policy_error: str | None = None,
+    retrieval_warning: str | None = None,
     codegraph_status: str = "not_used",
     max_chars: int = 12000,
 ) -> tuple[str, str]:
@@ -558,13 +570,42 @@ def _format_context(
         return "unavailable", "\n".join(lines)[:max_chars]
     if cards:
         lines.append(f"规范检索：已完成，命中 {len(cards)} 条")
+        per_rule_budget = min(
+            3200,
+            max(520, (max_chars - 700) // max(1, len(cards))),
+        )
         for card in cards:
-            statement = _text(card.get("statement"))
-            if len(statement) > 420:
-                statement = statement[:419] + "…"
+            raw_rule = card.get("rule")
+            rule = dict(raw_rule) if isinstance(raw_rule, Mapping) else {}
+            raw_metadata = rule.get("metadata")
+            metadata = (
+                dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+            )
+            statement = _text(card.get("statement") or rule.get("statement"))
+            statement_limit = min(600, max(180, per_rule_budget // 4))
+            if len(statement) > statement_limit:
+                statement = statement[: statement_limit - 1].rstrip() + "…"
             source = _text(card.get("source"))
             suffix = f"（来源：{source}）" if source else ""
-            lines.append(f"- [{card.get('id')}] {statement}{suffix}")
+            severity = _text(rule.get("severity") or card.get("severity"))
+            level = _text(metadata.get("level") or severity)
+            prefix = f"- [{card.get('id')}]"
+            if level:
+                prefix += f"【级别：{level}】"
+            lines.append(f"{prefix} {statement}{suffix}")
+
+            detail_fields = (
+                ("描述", metadata.get("description")),
+                ("反例", metadata.get("negative_example")),
+                ("正例", metadata.get("positive_example")),
+            )
+            remaining = max(0, per_rule_budget - len(statement) - len(suffix) - 80)
+            present = [(label, _text(value)) for label, value in detail_fields if _text(value)]
+            field_budget = max(100, remaining // max(1, len(present)))
+            for label, value in present:
+                if len(value) > field_budget:
+                    value = value[: field_budget - 1].rstrip() + "…"
+                lines.append(f"  【{label}】{value}")
         lines.append("实施状态：必须按上述已命中规范完成本次写入。")
         status = "matched"
     else:
@@ -576,6 +617,8 @@ def _format_context(
             ]
         )
         status = "none"
+    if retrieval_warning:
+        lines.append(f"语义检索：不可用，已自动回退到本地 BM25（{retrieval_warning}）")
     if codegraph_status == "used":
         lines.append("CodeGraph：本次输入声明已查询；它只作为代码事实来源。")
     elif codegraph_status == "unavailable":
@@ -717,6 +760,7 @@ class HookRuntime:
         self.ai_review_blocks_stop = _bool(
             _nested(self.config, "runtime", "ai_review_blocks_stop", True), True
         )
+        self.ai_settings = AISettings.from_config(self.config)
 
     def _resources(
         self, payload: Mapping[str, Any]
@@ -821,8 +865,18 @@ class HookRuntime:
             block_severities=self.block_severities,
         )
         cards: list[dict[str, Any]] = []
+        semantic_warning = ""
         if policy_error is None:
             try:
+                query_embedding, semantic_warning = embed_runtime_query(
+                    self.ai_settings,
+                    query=query,
+                    file_path=display,
+                    code=code,
+                    index_metadata=SQLitePolicyIndex(
+                        self.search_index_path
+                    ).read_metadata(),
+                )
                 cards = _search_cards(
                     self.search_index_path,
                     checker,
@@ -832,8 +886,11 @@ class HookRuntime:
                     limit=self.max_rules,
                     expected_policy_version=policy_version,
                     expected_bundle_id=bundle_id,
+                    query_embedding=query_embedding,
+                    semantic_weight=self.ai_settings.semantic_weight,
+                    min_similarity=self.ai_settings.min_similarity,
                 )
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, PolicyAIError) as exc:
                 policy_error = f"正式检索索引查询失败：{exc}"
         codegraph_status = _codegraph_status(payload)
         policy_status, context = _format_context(
@@ -841,6 +898,7 @@ class HookRuntime:
             cards,
             policy_version=policy_version,
             policy_error=policy_error,
+            retrieval_warning=semantic_warning,
             codegraph_status=codegraph_status,
             max_chars=self.max_context_chars,
         )
@@ -940,19 +998,33 @@ class HookRuntime:
         )
         proposed = _proposed_content(payload, target)
         cards: list[dict[str, Any]] = []
+        semantic_warning = ""
         if policy_error is None:
             try:
+                task_query = _text(payload.get("task") or payload.get("prompt"))
+                query_embedding, semantic_warning = embed_runtime_query(
+                    self.ai_settings,
+                    query=task_query,
+                    file_path=display,
+                    code=proposed,
+                    index_metadata=SQLitePolicyIndex(
+                        self.search_index_path
+                    ).read_metadata(),
+                )
                 cards = _search_cards(
                     self.search_index_path,
                     checker,
-                    query=_text(payload.get("task") or payload.get("prompt")),
+                    query=task_query,
                     file_path=display,
                     code=proposed,
                     limit=self.max_rules,
                     expected_policy_version=policy_version,
                     expected_bundle_id=bundle_id,
+                    query_embedding=query_embedding,
+                    semantic_weight=self.ai_settings.semantic_weight,
+                    min_similarity=self.ai_settings.min_similarity,
                 )
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, PolicyAIError) as exc:
                 policy_error = f"正式检索索引查询失败：{exc}"
         codegraph_status = _codegraph_status(payload)
         policy_status, context = _format_context(
@@ -960,6 +1032,7 @@ class HookRuntime:
             cards,
             policy_version=policy_version,
             policy_error=policy_error,
+            retrieval_warning=semantic_warning,
             codegraph_status=codegraph_status,
             max_chars=self.max_context_chars,
         )
@@ -1008,6 +1081,7 @@ class HookRuntime:
                 cards,
                 policy_version=policy_version,
                 policy_error=policy_error,
+                retrieval_warning=semantic_warning,
                 codegraph_status=codegraph_status,
                 max_chars=self.max_context_chars,
             )
@@ -1024,6 +1098,7 @@ class HookRuntime:
                     new_cards,
                     policy_version=policy_version,
                     policy_error=policy_error,
+                    retrieval_warning=semantic_warning,
                     codegraph_status=codegraph_status,
                     max_chars=self.max_context_chars,
                 )

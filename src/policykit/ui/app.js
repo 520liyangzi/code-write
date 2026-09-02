@@ -7,6 +7,7 @@ const API = Object.freeze({
   importDocuments: "/api/documents/import",
   prepare: "/api/prepare",
   decision: "/api/review/decision",
+  approve: "/api/review/approve",
   activate: "/api/activate",
   search: "/api/search",
 });
@@ -55,7 +56,7 @@ function cacheDom() {
     "statVersion", "statIndexHint", "documentScope", "dropZone", "fileInput",
     "chooseFilesButton", "fileQueue", "fileQueueEmpty", "fileSummary", "importButton",
     "prepareButton", "ruleSearch", "decisionFilter", "severityFilter", "scopeFilter",
-    "categoryFilter", "clearFiltersButton", "ruleCountText", "ruleList", "activationApproved",
+    "categoryFilter", "clearFiltersButton", "approveVisibleButton", "ruleCountText", "ruleList", "activationApproved",
     "activationPending", "activationRejected", "activationForm", "policyVersion", "activateButton", "searchForm",
     "searchQuery", "searchFile", "searchCode", "searchScopes", "searchCategories",
     "searchLimit", "searchButton", "searchResultCount", "searchIndexBadge", "searchResults",
@@ -102,6 +103,7 @@ function bindEvents() {
   [dom.ruleSearch, dom.decisionFilter, dom.severityFilter, dom.scopeFilter, dom.categoryFilter]
     .forEach((element) => element.addEventListener("input", renderRules));
   dom.clearFiltersButton.addEventListener("click", clearRuleFilters);
+  dom.approveVisibleButton.addEventListener("click", approveVisibleRules);
 
   dom.activationForm.addEventListener("submit", activateRules);
   dom.searchForm.addEventListener("submit", runSearch);
@@ -225,6 +227,7 @@ function renderStatus() {
   );
   const explicitlyActive = firstBoolean(status.activated, status.active, status.policy_active);
   const indexError = firstText(status.index_error);
+  const embeddingCount = firstNumber(status.embedding_count, 0);
   state.searchReady = explicitlyActive === true
     || (explicitlyActive === null && indexReady === true && version !== "未激活");
 
@@ -237,10 +240,14 @@ function renderStatus() {
     ? "当前审阅视图载入 " + state.rules.length + " 条"
     : "尚未生成候选规则";
   dom.statIndexHint.textContent = state.searchReady
-    ? "已激活正式索引可用"
+    ? (embeddingCount > 0
+      ? "已激活混合索引 · " + embeddingCount + " 条向量"
+      : "已激活 BM25 正式索引")
     : indexError ? "索引不可用：" + indexError
       : indexReady === false ? "检索索引尚未生成" : "索引状态未知";
-  dom.searchIndexBadge.textContent = state.searchReady ? "已激活正式索引" : "正式索引未激活";
+  dom.searchIndexBadge.textContent = state.searchReady
+    ? (embeddingCount > 0 ? "已激活 BM25 + 向量索引" : "已激活 BM25 索引")
+    : "正式索引未激活";
   dom.searchIndexBadge.classList.toggle("is-ready", state.searchReady);
   dom.searchButton.dataset.locked = String(!state.searchReady);
   dom.searchButton.disabled = !state.searchReady;
@@ -336,44 +343,46 @@ async function importDocuments() {
 }
 
 async function prepareCandidates() {
-  const counts = countDecisionsFromDrafts();
-  const resettable = Array.from(state.drafts.values()).filter((draft) =>
-    draft.decision !== "pending_review"
-      || Boolean(draft.edited_statement.trim())
-      || Boolean(draft.notes.trim())
-      || draft.dirty,
-  ).length;
-  let confirmReset = false;
-  if (resettable > 0) {
-    const confirmed = window.confirm(
-      "重新生成候选会重写 REVIEW_ME，并清空当前所有审批决定。\n\n"
-      + "当前已有：批准/修改后接受 " + (counts.approved + counts.modified)
-      + " 条，拒绝 " + counts.rejected + " 条；待处理备注或未保存草稿也会清除。\n\n"
-      + "确定继续生成候选吗？",
+  const dirty = Array.from(state.drafts.values()).filter((draft) => draft.dirty).length;
+  if (dirty) {
+    toast(
+      "仍有未保存决定",
+      "请先保存 " + dirty + " 条规则的决定，再重新生成候选。",
+      "warning",
     );
-    if (!confirmed) return;
-    confirmReset = true;
+    return;
   }
   setButtonBusy(dom.prepareButton, true);
   try {
+    let prepared;
     try {
-      await request(API.prepare, { method: "POST", body: { confirm_reset: confirmReset } });
+      prepared = await request(API.prepare, { method: "POST", body: { confirm_reset: false } });
     } catch (error) {
-      if (error.status !== 409 || error.code !== "review_decisions_exist" || confirmReset) throw error;
+      if (error.status !== 409 || error.code !== "review_decisions_exist") throw error;
       const serverCounts = objectOrEmpty(error.details && error.details.decision_counts);
+      const preserved = firstNumber(error.details && error.details.preserved_count, 0);
       const confirmed = window.confirm(
-        "服务端检测到已有审批决定。重新生成候选会重写 REVIEW_ME，并清空这些决定。\n\n"
+        "新文档中有已删除或已变化的规则，对应旧决定无法自动继承。\n\n"
+        + "可安全保留：" + preserved + " 条；"
         + "批准：" + firstNumber(serverCounts.approved, 0) + " 条；"
         + "修改后接受：" + firstNumber(serverCounts.modified, 0) + " 条；"
         + "拒绝：" + firstNumber(serverCounts.rejected, 0) + " 条。\n\n"
-        + "确定继续吗？",
+        + "确定丢弃上面这些已失效决定并继续吗？",
       );
       if (!confirmed) return;
-      await request(API.prepare, { method: "POST", body: { confirm_reset: true } });
+      prepared = await request(API.prepare, { method: "POST", body: { confirm_reset: true } });
     }
     state.drafts = new Map();
     await Promise.all([loadStatus(), loadReview(), loadRawReview()]);
-    toast("候选已生成", "请逐条审阅；此操作没有激活任何规则。", "success");
+    const preserved = firstNumber(prepared && prepared.preserved_decision_count, 0);
+    const pending = firstNumber(prepared && prepared.new_pending_count, state.rules.length);
+    const warnings = arrayOf(prepared && prepared.warnings);
+    toast(
+      warnings.length ? "候选已生成，增强已回退" : "候选已生成",
+      "已保留 " + preserved + " 条既有决定；只需处理 " + pending
+        + " 条新增或变化规则。" + (warnings.length ? " " + warnings.join("；") : ""),
+      warnings.length ? "warning" : "success",
+    );
     document.getElementById("review").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (error) {
     showPageError(errorMessage(error));
@@ -410,6 +419,10 @@ function renderRules() {
   const filtered = filteredRules();
   dom.ruleList.replaceChildren();
   dom.ruleCountText.textContent = "显示 " + filtered.length + " / " + state.rules.length + " 条候选规则";
+  dom.approveVisibleButton.disabled = !filtered.some((rule) => {
+    const draft = state.drafts.get(rule.id);
+    return draft && draft.decision === "pending_review" && !draft.dirty;
+  });
 
   if (!state.rules.length) {
     dom.ruleList.append(emptyState("尚无候选规则", "先导入 Markdown，再点击“生成候选规则”。", "◇"));
@@ -467,6 +480,23 @@ function createRuleDetails(rule) {
   const summary = element("summary", "", "查看来源原文与 checker 详情");
   const grid = element("div", "detail-grid");
   const source = objectOrEmpty(rule.source);
+  const metadata = objectOrEmpty(rule.metadata);
+
+  if (metadata.structured_format) {
+    const contentBox = element("div", "detail-box detail-box-wide");
+    contentBox.append(element("h4", "", "完整规则内容"));
+    if (metadata.level) contentBox.append(element("p", "source-meta", "级别：" + metadata.level));
+    if (metadata.description) {
+      contentBox.append(element("h5", "", "描述"));
+      contentBox.append(element("p", "", String(metadata.description)));
+    }
+    [["negative_example", "反例"], ["positive_example", "正例"]].forEach(([key, label]) => {
+      if (!metadata[key]) return;
+      contentBox.append(element("h5", "", label));
+      contentBox.append(element("pre", "rule-example", String(metadata[key])));
+    });
+    grid.append(contentBox);
+  }
 
   const sourceBox = element("div", "detail-box");
   sourceBox.append(element("h4", "", "来源原文"));
@@ -484,6 +514,42 @@ function createRuleDetails(rule) {
   grid.append(sourceBox, checkerBox);
   details.append(summary, grid);
   return details;
+}
+
+async function approveVisibleRules() {
+  const rules = filteredRules().filter((rule) => {
+    const draft = state.drafts.get(rule.id);
+    return draft && draft.decision === "pending_review" && !draft.dirty;
+  });
+  if (!rules.length) {
+    toast("没有可批量批准的规则", "当前筛选结果中没有未处理且已同步的规则。", "warning");
+    return;
+  }
+  const confirmed = window.confirm(
+    "确认批量批准当前筛选中的 " + rules.length + " 条待处理规则吗？\n\n"
+    + "建议先通过筛选和规则详情核对范围；已有决定不会被覆盖。",
+  );
+  if (!confirmed) return;
+  setButtonBusy(dom.approveVisibleButton, true);
+  try {
+    await request(API.approve, {
+      method: "POST",
+      body: {
+        rules: rules.map((rule) => ({
+          rule_id: rule.id,
+          review_hash: rule.review_hash,
+          decision_hash: rule.decision_hash,
+        })),
+      },
+    });
+    await Promise.all([loadStatus(), loadReview(), loadRawReview()]);
+    toast("批量批准完成", "已批准 " + rules.length + " 条规则。", "success");
+  } catch (error) {
+    showPageError(errorMessage(error));
+    toast("批量批准失败", errorMessage(error), "error");
+  } finally {
+    setButtonBusy(dom.approveVisibleButton, false);
+  }
 }
 
 function createReviewEditor(rule, draft, card, stateLabel) {
@@ -608,11 +674,15 @@ function filteredRules() {
 
   return state.rules.filter((rule) => {
     const draft = state.drafts.get(rule.id);
+    const metadata = objectOrEmpty(rule.metadata);
     const haystack = [
       rule.id, rule.title, rule.statement, rule.category, rule.scope,
       rule.source && rule.source.document,
       rule.source && rule.source.section,
       rule.source && rule.source.quote,
+      metadata.level, metadata.description, metadata.negative_example,
+      metadata.positive_example, metadata.retrieval_intent,
+      ...arrayOf(metadata.aliases), ...arrayOf(metadata.code_signals),
     ].filter(Boolean).join(" ").toLocaleLowerCase("zh-CN");
     return (!query || haystack.includes(query))
       && (decision === "all" || (draft && draft.decision === decision))
@@ -663,9 +733,23 @@ async function activateRules(event) {
   if (!confirmed) return;
   setButtonBusy(dom.activateButton, true);
   try {
-    await request(API.activate, { method: "POST", body: { policy_version: version } });
+    const activated = await request(API.activate, {
+      method: "POST",
+      body: { policy_version: version },
+    });
     await Promise.all([loadStatus(), loadReview(), loadRawReview()]);
-    toast("规则库已激活", "策略版本：" + version, "success");
+    const warnings = arrayOf(activated && activated.warnings);
+    const embedding = objectOrEmpty(activated && activated.embedding);
+    const vectorText = embedding.enabled
+      ? "；向量缓存 " + firstNumber(embedding.cached, 0)
+        + "，新生成 " + firstNumber(embedding.generated, 0)
+      : "；当前使用 BM25";
+    toast(
+      warnings.length ? "规则库已激活，部分能力已回退" : "规则库已激活",
+      "策略版本：" + version + vectorText
+        + (warnings.length ? "；" + warnings.join("；") : ""),
+      warnings.length ? "warning" : "success",
+    );
   } catch (error) {
     showPageError(errorMessage(error));
     toast("激活失败", errorMessage(error), "error");
@@ -723,6 +807,10 @@ function renderSearchResults(payload) {
   }
   dom.searchResults.replaceChildren();
   dom.searchResultCount.textContent = results.length + " 条结果";
+  const semanticError = firstText(payload && payload.semantic_error);
+  dom.searchResultCount.title = semanticError
+    ? "语义检索不可用，已回退 BM25：" + semanticError
+    : "";
   if (!results.length) {
     dom.searchResults.append(emptyState("没有召回规则", "尝试增加目标路径、代码片段，或放宽范围/分类过滤。", "⌕"));
     return;
@@ -748,6 +836,21 @@ function renderSearchResults(payload) {
     if (miniBadges.childNodes.length) card.append(miniBadges);
 
     card.append(element("p", "result-statement", firstText(rule.statement, item.statement, "无可显示规则正文")));
+    const metadata = objectOrEmpty(rule.metadata);
+    if (metadata.structured_format) {
+      const details = element("details", "result-details");
+      details.append(element("summary", "", "查看级别、描述、反例与正例"));
+      const body = element("div", "result-details-body");
+      if (metadata.level) body.append(element("p", "", "级别：" + metadata.level));
+      if (metadata.description) body.append(element("p", "", String(metadata.description)));
+      [["negative_example", "反例"], ["positive_example", "正例"]].forEach(([key, label]) => {
+        if (!metadata[key]) return;
+        body.append(element("h4", "", label));
+        body.append(element("pre", "rule-example", String(metadata[key])));
+      });
+      details.append(body);
+      card.append(details);
+    }
     const reasons = arrayOf(item.reasons || item.match_reasons || item.matched_terms);
     if (reasons.length) {
       const list = element("ul", "reason-list");

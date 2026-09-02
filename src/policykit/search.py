@@ -1,4 +1,4 @@
-"""Small, dependency-free policy search with Chinese character bigrams.
+"""Dependency-free lexical search with optional semantic-vector blending.
 
 JSON remains the authoritative policy store.  The optional SQLite file is a
 rebuildable acceleration artifact and contains explicit token postings rather
@@ -16,7 +16,7 @@ from pathlib import Path
 import re
 import sqlite3
 import unicodedata
-from typing import Any
+from typing import Any, Sequence
 
 from .model import PolicyRule
 
@@ -26,6 +26,35 @@ _LATIN_TOKEN_RE = re.compile(
     r"@?[A-Za-z_$][A-Za-z0-9_$]*(?:[.\-/:\\][A-Za-z0-9_$*]+)*|\d+(?:\.\d+)*"
 )
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_LOW_SIGNAL_TOKENS = frozenset(
+    {
+        "java",
+        "src",
+        "main",
+        "test",
+        "com",
+        "org",
+        "net",
+        "io",
+        "get",
+        "set",
+        "value",
+        "values",
+        "data",
+        "object",
+        "string",
+        "request",
+        "response",
+        "result",
+        "创建",
+        "新增",
+        "修改",
+        "编写",
+        "实现",
+        "代码",
+    }
+)
+_RELATIVE_SCORE_FLOOR = 0.22
 
 
 def _ordered_unique(values: Iterable[str]) -> list[str]:
@@ -35,7 +64,7 @@ def _ordered_unique(values: Iterable[str]) -> list[str]:
 def tokenize(text: str) -> list[str]:
     """Tokenize identifiers and Chinese text without a dictionary dependency.
 
-    Chinese runs emit characters and adjacent-character bigrams.  Identifiers
+    Chinese runs emit phrases plus adjacent bigrams/trigrams.  Identifiers
     emit their full form plus dot/underscore/path and camel-case components.
     This makes queries such as ``线程管理`` match rules phrased as ``线程池管理``
     while retaining exact API matches such as ``Map.of``.
@@ -46,10 +75,12 @@ def tokenize(text: str) -> list[str]:
 
     for match in _CJK_RUN_RE.finditer(normalized):
         run = match.group(0)
-        if len(run) <= 16:
+        if len(run) <= 32:
             tokens.append(run)
-        tokens.extend(run)
+        if len(run) == 1:
+            tokens.append(run)
         tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
+        tokens.extend(run[index : index + 3] for index in range(len(run) - 2))
 
     without_cjk = _CJK_RUN_RE.sub(" ", normalized)
     for match in _LATIN_TOKEN_RE.finditer(without_cjk):
@@ -73,10 +104,12 @@ def token_frequencies(text: str) -> Counter[str]:
     values: list[str] = []
     for match in _CJK_RUN_RE.finditer(normalized):
         run = match.group(0)
-        if len(run) <= 16:
+        if len(run) <= 32:
             values.append(run)
-        values.extend(run)
+        if len(run) == 1:
+            values.append(run)
         values.extend(run[index : index + 2] for index in range(len(run) - 1))
+        values.extend(run[index : index + 3] for index in range(len(run) - 2))
     without_cjk = _CJK_RUN_RE.sub(" ", normalized)
     for match in _LATIN_TOKEN_RE.finditer(without_cjk):
         original = match.group(0)
@@ -189,9 +222,15 @@ def _scope_set(scopes: Iterable[str] | str | None) -> set[str] | None:
 def _query_terms(
     query: str, file_path: str, code: str
 ) -> tuple[list[str], list[str], list[str], Counter[str]]:
-    query_tokens = tokenize(query)
-    path_tokens = tokenize(file_path)
-    code_tokens = tokenize(code)
+    query_tokens = [
+        token for token in tokenize(query) if token not in _LOW_SIGNAL_TOKENS
+    ]
+    path_tokens = [
+        token for token in tokenize(file_path) if token not in _LOW_SIGNAL_TOKENS
+    ]
+    code_tokens = [
+        token for token in tokenize(code) if token not in _LOW_SIGNAL_TOKENS
+    ]
     weighted: Counter[str] = Counter()
     weighted.update({term: 3.0 for term in query_tokens})
     weighted.update({term: 2.0 for term in path_tokens})
@@ -313,7 +352,10 @@ def _score_results(
             item.rule.id,
         )
     )
-    return results[:limit]
+    if not results:
+        return []
+    score_floor = max(0.0, results[0].score * _RELATIVE_SCORE_FLOOR)
+    return [result for result in results if result.score >= score_floor][:limit]
 
 
 class PolicySearchIndex:
@@ -470,6 +512,8 @@ def build_sqlite_index(
     approved_only: bool = True,
     policy_version: str | None = None,
     bundle_id: str | None = None,
+    embeddings: Mapping[str, Sequence[float]] | None = None,
+    embedding_model: str | None = None,
 ) -> Path:
     """Build an atomic, disposable SQLite postings index."""
 
@@ -480,8 +524,21 @@ def build_sqlite_index(
         temporary.unlink()
 
     selected = [rule for rule in rules if not approved_only or rule.active]
+    selected_ids = {rule.id for rule in selected}
     normalized_policy_version = str(policy_version or "").strip()
     normalized_bundle_id = _normalized_bundle_id(bundle_id) if bundle_id else ""
+    normalized_embeddings: dict[str, list[float]] = {}
+    embedding_dimensions: set[int] = set()
+    for rule_id, vector in (embeddings or {}).items():
+        if str(rule_id) not in selected_ids:
+            continue
+        values = [float(value) for value in vector]
+        if not values or any(not math.isfinite(value) for value in values):
+            raise ValueError(f"规则 {rule_id} 的 embedding 向量无效")
+        normalized_embeddings[str(rule_id)] = values
+        embedding_dimensions.add(len(values))
+    if len(embedding_dimensions) > 1:
+        raise ValueError("规则 embedding 向量维度不一致")
     connection = sqlite3.connect(temporary)
     try:
         connection.executescript(
@@ -505,6 +562,13 @@ def build_sqlite_index(
                 FOREIGN KEY (rule_id) REFERENCES rules(rule_id)
             );
             CREATE INDEX postings_rule_id_idx ON postings(rule_id);
+            CREATE TABLE embeddings (
+                rule_id TEXT PRIMARY KEY,
+                model TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector_json TEXT NOT NULL,
+                FOREIGN KEY (rule_id) REFERENCES rules(rule_id)
+            );
             """
         )
         metadata = [
@@ -515,6 +579,12 @@ def build_sqlite_index(
             metadata.append(("policy_version", normalized_policy_version))
         if normalized_bundle_id:
             metadata.append(("bundle_id", normalized_bundle_id))
+        metadata.append(("embedding_count", str(len(normalized_embeddings))))
+        if normalized_embeddings:
+            metadata.append(("embedding_model", str(embedding_model or "unknown")))
+            metadata.append(
+                ("embedding_dimensions", str(next(iter(embedding_dimensions))))
+            )
         connection.executemany(
             "INSERT INTO metadata(key, value) VALUES (?, ?)", metadata
         )
@@ -535,6 +605,18 @@ def build_sqlite_index(
                 "VALUES (?, ?, ?)",
                 ((term, rule.id, count) for term, count in frequencies.items()),
             )
+            vector = normalized_embeddings.get(rule.id)
+            if vector is not None:
+                connection.execute(
+                    "INSERT INTO embeddings(rule_id, model, dimensions, vector_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        rule.id,
+                        str(embedding_model or "unknown"),
+                        len(vector),
+                        json.dumps(vector, separators=(",", ":")),
+                    ),
+                )
         connection.commit()
     finally:
         # sqlite3.Connection's context manager commits/rolls back but does not
@@ -594,7 +676,7 @@ class SQLitePolicyIndex:
             )
         return metadata
 
-    def search(
+    def _lexical_search(
         self,
         query: str = "",
         file_path: str = "",
@@ -720,6 +802,159 @@ class SQLitePolicyIndex:
             categories=categories,
         )
 
+    @staticmethod
+    def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+        if len(left) != len(right) or not left:
+            return -1.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if left_norm == 0.0 or right_norm == 0.0:
+            return -1.0
+        return dot / (left_norm * right_norm)
+
+    def _semantic_search(
+        self,
+        query_embedding: Sequence[float],
+        *,
+        limit: int,
+        scopes: Iterable[str] | str | None,
+        categories: Iterable[str] | str | None,
+        min_similarity: float,
+    ) -> list[SearchResult]:
+        vector = [float(value) for value in query_embedding]
+        if not vector or any(not math.isfinite(value) for value in vector):
+            raise ValueError("查询 embedding 向量无效")
+        metadata = self.read_metadata()
+        if int(metadata.get("embedding_count", "0") or 0) <= 0:
+            return []
+        expected_dimensions = int(metadata.get("embedding_dimensions", "0") or 0)
+        if expected_dimensions and len(vector) != expected_dimensions:
+            raise PolicyIndexMetadataError(
+                "查询 embedding 维度与索引不一致："
+                f"query={len(vector)}, index={expected_dimensions}"
+            )
+        requested_scopes = _scope_set(scopes)
+        requested_categories = _scope_set(categories)
+        connection = sqlite3.connect(self.path)
+        try:
+            rows = connection.execute(
+                "SELECT r.payload, e.vector_json FROM rules AS r "
+                "JOIN embeddings AS e ON e.rule_id = r.rule_id"
+            ).fetchall()
+        except sqlite3.DatabaseError as error:
+            raise PolicyIndexMetadataError(
+                f"无法读取语义检索向量：{error}"
+            ) from error
+        finally:
+            connection.close()
+        results: list[SearchResult] = []
+        for payload, raw_vector in rows:
+            rule = PolicyRule.from_dict(json.loads(payload))
+            if requested_scopes and rule.scope.casefold() not in requested_scopes:
+                continue
+            if (
+                requested_categories
+                and rule.category.casefold() not in requested_categories
+            ):
+                continue
+            stored = [float(value) for value in json.loads(raw_vector)]
+            similarity = self._cosine(vector, stored)
+            if similarity < min_similarity:
+                continue
+            results.append(
+                SearchResult(
+                    rule=rule,
+                    score=round(similarity, 6),
+                    reasons=(f"语义相似度：{similarity:.3f}",),
+                )
+            )
+        results.sort(key=lambda item: (-item.score, item.rule.id))
+        return results[: max(limit, 0)]
+
+    def search(
+        self,
+        query: str = "",
+        file_path: str = "",
+        code: str = "",
+        limit: int = 20,
+        scopes: Iterable[str] | str | None = None,
+        *,
+        categories: Iterable[str] | str | None = None,
+        expected_policy_version: str | None = None,
+        expected_bundle_id: str | None = None,
+        query_embedding: Sequence[float] | None = None,
+        semantic_weight: float = 0.4,
+        min_similarity: float = 0.28,
+    ) -> list[SearchResult]:
+        """Run lexical BM25 and optionally blend cached semantic vectors."""
+
+        expanded_limit = max(limit * 4, 40)
+        lexical = self._lexical_search(
+            query=query,
+            file_path=file_path,
+            code=code,
+            limit=expanded_limit if query_embedding is not None else limit,
+            scopes=scopes,
+            categories=categories,
+            expected_policy_version=expected_policy_version,
+            expected_bundle_id=expected_bundle_id,
+        )
+        if query_embedding is None or limit <= 0:
+            return lexical[: max(limit, 0)]
+        semantic = self._semantic_search(
+            query_embedding,
+            limit=expanded_limit,
+            scopes=scopes,
+            categories=categories,
+            min_similarity=min(1.0, max(-1.0, float(min_similarity))),
+        )
+        weight = min(1.0, max(0.0, float(semantic_weight)))
+        lexical_by_id = {result.rule_id: result for result in lexical}
+        semantic_by_id = {result.rule_id: result for result in semantic}
+        merged: list[SearchResult] = []
+        for rule_id in set(lexical_by_id) | set(semantic_by_id):
+            lexical_result = lexical_by_id.get(rule_id)
+            semantic_result = semantic_by_id.get(rule_id)
+            rule = (
+                lexical_result.rule if lexical_result is not None else semantic_result.rule
+            )
+            lexical_score = lexical_result.score if lexical_result else 0.0
+            semantic_score = semantic_result.score if semantic_result else 0.0
+            reasons = tuple(
+                dict.fromkeys(
+                    (*(
+                        lexical_result.reasons if lexical_result else ()
+                    ), *(
+                        semantic_result.reasons if semantic_result else ()
+                    ))
+                )
+            )
+            matched_terms = (
+                lexical_result.matched_terms if lexical_result is not None else ()
+            )
+            merged.append(
+                SearchResult(
+                    rule=rule,
+                    score=round(lexical_score + weight * 8.0 * max(0.0, semantic_score), 6),
+                    reasons=reasons,
+                    matched_terms=matched_terms,
+                )
+            )
+        merged.sort(
+            key=lambda item: (
+                -item.score,
+                {"blocker": 0, "major": 1, "advisory": 2}.get(
+                    item.rule.severity, 3
+                ),
+                item.rule.id,
+            )
+        )
+        if not merged:
+            return []
+        score_floor = max(0.0, merged[0].score * _RELATIVE_SCORE_FLOOR)
+        return [result for result in merged if result.score >= score_floor][:limit]
+
 
 def _search_result_card(result: SearchResult) -> dict[str, Any]:
     return {
@@ -753,6 +988,9 @@ def retrieve_runtime_rules(
     categories: Iterable[str] | str | None = None,
     expected_policy_version: str | None = None,
     expected_bundle_id: str | None = None,
+    query_embedding: Sequence[float] | None = None,
+    semantic_weight: float = 0.4,
+    min_similarity: float = 0.28,
 ) -> list[dict[str, Any]]:
     """Merge ranked retrieval with every directly applicable checker rule.
 
@@ -782,6 +1020,9 @@ def retrieve_runtime_rules(
             categories=categories,
             expected_policy_version=expected_policy_version,
             expected_bundle_id=expected_bundle_id,
+            query_embedding=query_embedding,
+            semantic_weight=semantic_weight,
+            min_similarity=min_similarity,
         )
     else:
         matches = index.search(

@@ -304,8 +304,20 @@ class PolicyStudioTests(unittest.TestCase):
         self.assertEqual("stale_decision", captured.exception.code)
         self.assertEqual("approved", self.studio.review()["rules"][0]["decision"])
 
-    def test_prepare_requires_confirmation_before_resetting_decisions(self) -> None:
+    def test_prepare_preserves_unchanged_decisions_without_confirmation(self) -> None:
         self.approve_rule()
+        prepared = self.studio.prepare({})
+        self.assertEqual(0, prepared["reset_decision_count"])
+        self.assertEqual(1, prepared["preserved_decision_count"])
+        self.assertEqual("approved", self.studio.review()["rules"][0]["decision"])
+
+    def test_prepare_requires_confirmation_when_decided_rule_changes(self) -> None:
+        self.approve_rule()
+        source = self.home / "policy-sources" / "company" / "Java编码规范.md"
+        source.write_text(
+            "# 集合规范\n\n- 禁止向 `Map.of` 传入 null 键或值。\n",
+            encoding="utf-8",
+        )
         with self.assertRaises(StudioError) as captured:
             self.studio.prepare({})
         self.assertEqual(409, captured.exception.status)
@@ -330,13 +342,40 @@ class PolicyStudioTests(unittest.TestCase):
                 "notes": "需要部门确认适用边界",
             }
         )
-        with self.assertRaises(StudioError) as captured:
-            self.studio.prepare({})
-        self.assertEqual("review_decisions_exist", captured.exception.code)
-        self.assertEqual(
-            {"pending_review": 1},
-            captured.exception.details["decision_counts"],
+        prepared = self.studio.prepare({})
+        self.assertEqual(1, prepared["preserved_decision_count"])
+        preserved = self.studio.review()["rules"][0]
+        self.assertEqual("pending_review", preserved["decision"])
+        self.assertEqual("需要部门确认适用边界", preserved["notes"])
+
+    def test_bulk_approval_updates_pending_rules_once(self) -> None:
+        first = self.prepare_one_rule()
+        result = self.studio.approve_rules(
+            {
+                "rules": [
+                    {
+                        "rule_id": first["id"],
+                        "review_hash": first["review_hash"],
+                        "decision_hash": first["decision_hash"],
+                    }
+                ]
+            }
         )
+        self.assertEqual(1, result["approved_count"])
+        self.assertEqual("approved", self.studio.review()["rules"][0]["decision"])
+        with self.assertRaises(StudioError) as captured:
+            self.studio.approve_rules(
+                {
+                    "rules": [
+                        {
+                            "rule_id": first["id"],
+                            "review_hash": first["review_hash"],
+                            "decision_hash": first["decision_hash"],
+                        }
+                    ]
+                }
+            )
+        self.assertEqual("decision_not_pending", captured.exception.code)
 
     def test_activate_and_search_use_sqlite_index_only(self) -> None:
         self.approve_rule()
@@ -422,9 +461,9 @@ class PolicyStudioTests(unittest.TestCase):
         self.assertEqual(1, before["active_rule_count"])
         self.assertTrue(before["activated"])
 
-        self.studio.prepare({"confirm_reset": True})
+        self.studio.prepare({})
         after = self.studio.status()
-        self.assertEqual(0, after["approved_count"])
+        self.assertEqual(1, after["approved_count"])
         self.assertEqual(1, after["active_rule_count"])
         self.assertEqual("active-before-reset", after["policy_version"])
         self.assertTrue(after["activated"])

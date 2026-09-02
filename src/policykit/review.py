@@ -83,6 +83,23 @@ def _checker_draft(rule: PolicyRule) -> list[str]:
     ]
 
 
+def _structured_details(rule: PolicyRule) -> list[str]:
+    metadata = rule.metadata or {}
+    if not metadata.get("structured_format"):
+        return []
+    lines = ["### 结构化规则详情", ""]
+    level = str(metadata.get("level") or "未标注").strip()
+    lines.extend([f"- 级别：`{level}`", ""])
+    for key, label in (
+        ("description", "描述"),
+        ("negative_example", "反例"),
+        ("positive_example", "正例"),
+    ):
+        value = str(metadata.get(key) or "").strip()
+        lines.extend([f"#### {label}", "", value or "（未提供）", ""])
+    return lines
+
+
 def review_fingerprint(rule: PolicyRule) -> str:
     """Bind a review decision to the exact candidate and checker draft shown."""
 
@@ -96,6 +113,65 @@ def review_fingerprint(rule: PolicyRule) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return sha256(encoded).hexdigest()
+
+
+def reconcile_review_decisions(
+    previous_rules: Iterable[PolicyRule],
+    previous_decisions: Mapping[str, ReviewDecision],
+    new_rules: Iterable[PolicyRule],
+) -> tuple[dict[str, ReviewDecision], list[ReviewDecision]]:
+    """Carry decisions forward only for byte-equivalent candidate meaning.
+
+    New rules remain pending.  Changed or removed rules are returned as
+    ``dropped`` when their old decision contains user work, allowing callers
+    to request one explicit reset confirmation instead of asking the user to
+    re-approve every unchanged rule in every batch.
+    """
+
+    old_by_id = {rule.id: rule for rule in previous_rules}
+    new_by_id = {rule.id: rule for rule in new_rules}
+    preserved: dict[str, ReviewDecision] = {}
+    preserved_ids: set[str] = set()
+    for rule_id, rule in new_by_id.items():
+        old_rule = old_by_id.get(rule_id)
+        decision = previous_decisions.get(rule_id)
+        if old_rule is None or decision is None:
+            continue
+        if (
+            decision.decision == "pending_review"
+            and not decision.edited_statement
+            and not decision.notes
+        ):
+            # An untouched review block is the default state, not user work.
+            # Re-render it as unchecked rather than turning "暂不处理" into
+            # an explicit checked decision on every prepare/review run.
+            continue
+        old_fingerprint = review_fingerprint(old_rule)
+        if (
+            decision.review_hash != old_fingerprint
+            or old_fingerprint != review_fingerprint(rule)
+        ):
+            continue
+        preserved[rule_id] = ReviewDecision(
+            rule_id=rule_id,
+            decision=decision.decision,
+            review_hash=review_fingerprint(rule),
+            edited_statement=decision.edited_statement,
+            notes=decision.notes,
+        )
+        preserved_ids.add(rule_id)
+
+    dropped = [
+        decision
+        for rule_id, decision in previous_decisions.items()
+        if rule_id not in preserved_ids
+        and (
+            decision.decision != "pending_review"
+            or bool(decision.edited_statement)
+            or bool(decision.notes)
+        )
+    ]
+    return preserved, dropped
 
 
 def _review_decision_map(
@@ -220,6 +296,7 @@ def render_review(
                 "",
                 rule.statement,
                 "",
+                *_structured_details(rule),
                 "### 文档原文",
                 "",
                 _blockquote(rule.source.quote or rule.statement),
@@ -531,6 +608,7 @@ __all__ = [
     "load_rules_json",
     "parse_review_decisions",
     "read_review_decisions",
+    "reconcile_review_decisions",
     "render_review",
     "review_fingerprint",
     "rules_payload",

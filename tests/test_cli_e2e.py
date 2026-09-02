@@ -10,7 +10,7 @@ from pathlib import Path
 
 from policykit.cli import main
 from policykit.model import PolicyRule
-from policykit.review import bundle_fingerprint
+from policykit.review import bundle_fingerprint, read_review_decisions
 from policykit.search import build_sqlite_index
 
 
@@ -59,7 +59,7 @@ class CliEndToEndTests(unittest.TestCase):
 
             status, output, error = self.run_cli("--home", str(home), "prepare")
             self.assertEqual(0, status, error)
-            self.assertIn("1 条待审阅", output)
+            self.assertIn("新增待审 1 条", output)
 
             status, output, error = self.run_cli("--home", str(home), "review")
             self.assertEqual(0, status, error)
@@ -88,6 +88,34 @@ class CliEndToEndTests(unittest.TestCase):
             )
             self.assertEqual(0, status, error)
             self.assertIn("命中 1 条", output)
+
+    def test_prepare_preserves_unchanged_cli_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.run_cli("--home", str(home), "init")
+            source = home / "policy-sources" / "company" / "Java编码规范.md"
+            source.write_text(
+                "# 命名\n\n- 变量必须使用小驼峰命名。\n",
+                encoding="utf-8",
+            )
+            self.run_cli("--home", str(home), "prepare")
+            review = home / ".policy-work" / "REVIEW_ME.md"
+            review.write_text(
+                review.read_text(encoding="utf-8").replace(
+                    "- [ ] 接受并启用 <!-- decision:approved -->",
+                    "- [x] 接受并启用 <!-- decision:approved -->",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            status, output, error = self.run_cli(
+                "--home", str(home), "prepare"
+            )
+            self.assertEqual(0, status, error)
+            self.assertIn("保留 1 条既有决定", output)
+            self.assertEqual(
+                "approved", read_review_decisions(review)[0].decision
+            )
 
     def test_review_rejects_invalid_checker_draft(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -134,7 +162,14 @@ class CliEndToEndTests(unittest.TestCase):
             approved_path = home / ".policy-work" / "approved-rules.json"
             before = approved_path.read_bytes()
 
-            self.run_cli("--home", str(home), "review")
+            review.write_text(
+                review.read_text(encoding="utf-8").replace(
+                    "- [x] 接受并启用 <!-- decision:approved -->",
+                    "- [ ] 接受并启用 <!-- decision:approved -->",
+                    1,
+                ),
+                encoding="utf-8",
+            )
             status, _, error = self.run_cli(
                 "--home", str(home), "activate", "--policy-version", "empty-v2"
             )

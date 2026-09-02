@@ -182,6 +182,52 @@ class HookTests(unittest.TestCase):
         reports = list((self.home / "audit" / "reports").glob("*.md"))
         self.assertTrue(reports)
 
+    def test_hook_context_includes_structured_rule_details(self) -> None:
+        self.rules.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "policy_version": "structured-test",
+                    "rules": [
+                        {
+                            "id": "G.EDV.02",
+                            "title": "禁止直接使用外部数据构造格式化字符串",
+                            "statement": "禁止直接使用外部数据构造格式化字符串",
+                            "status": "approved",
+                            "severity": "blocker",
+                            "source": {"document": "security.md"},
+                            "trigger_terms": ["String.format"],
+                            "metadata": {
+                                "structured_format": True,
+                                "level": "要求",
+                                "description": "格式模板必须由程序定义。",
+                                "negative_example": "String.format(formatFromRequest, value);",
+                                "positive_example": "String.format(\"%s\", value);",
+                            },
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        self._rebuild_index()
+        prepared = prepare_receipt(
+            self.target,
+            "structured-context",
+            query="格式化输出",
+            code="String.format(formatFromRequest, value);",
+            config=self.config,
+            home=self.home,
+            cwd=self.home,
+        )
+        context = prepared["context"]
+        self.assertIn("G.EDV.02", context)
+        self.assertIn("【级别：要求】", context)
+        self.assertIn("【描述】格式模板必须由程序定义。", context)
+        self.assertIn("【反例】String.format(formatFromRequest, value);", context)
+        self.assertIn("【正例】String.format(\"%s\", value);", context)
+
     def test_pre_hook_exception_uses_pretooluse_deny_schema(self) -> None:
         output = StringIO()
         status = main_hook(

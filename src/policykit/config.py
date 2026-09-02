@@ -18,6 +18,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "review": ".policy-work/REVIEW_ME.md",
         "approved_rules": ".policy-work/approved-rules.json",
         "search_index": ".policy-work/search-index.db",
+        "ai_cache": ".policy-work/ai-enrichment-cache.json",
+        "embedding_cache": ".policy-work/embedding-cache.json",
         "global_block": ".policy-work/GLOBAL_MD_BLOCK.md",
         "receipts_dir": ".policy-work/receipts",
         "audit_dir": ".policy-work/audit",
@@ -36,6 +38,36 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "review": {
         "global_core_limit": 40,
         "activate_only_approved": True,
+    },
+    "ai": {
+        "provider": "disabled",
+        "base_url": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "timeout_seconds": 30,
+        "required": False,
+        "max_input_chars": 16000,
+        "llm": {
+            "enabled": False,
+            "model": "",
+            "batch_size": 12,
+        },
+        "embedding": {
+            "enabled": False,
+            "model": "text-embedding-3-small",
+            "dimensions": None,
+            "batch_size": 64,
+            "semantic_weight": 0.4,
+            "min_similarity": 0.28,
+        },
+    },
+    "database": {
+        "enabled": False,
+        "adapter": "sqlite",
+        "url_env": "POLICYKIT_DATABASE_URL",
+        "url": "",
+        "required": False,
+        "custom_factory": "",
+        "options": {},
     },
     "codegraph": {
         "enabled": False,
@@ -102,11 +134,16 @@ def _apply_environment(config: dict[str, Any]) -> dict[str, Any]:
         "POLICYKIT_SEARCH_INDEX": "search_index",
         "POLICYKIT_RECEIPTS_DIR": "receipts_dir",
         "POLICYKIT_AUDIT_DIR": "audit_dir",
+        "POLICYKIT_AI_CACHE": "ai_cache",
+        "POLICYKIT_EMBEDDING_CACHE": "embedding_cache",
     }
     for variable, key in path_variables.items():
         value = os.environ.get(variable)
         if value:
             config.setdefault("paths", {})[key] = value
+    database_url = os.environ.get("POLICYKIT_DATABASE_URL")
+    if database_url:
+        config.setdefault("database", {})["url"] = database_url
     return config
 
 

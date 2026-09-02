@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .ai import (
+    AISettings,
+    PolicyAIError,
+    build_embeddings_cached,
+    embed_runtime_query,
+    enrich_rules_cached,
+)
 from .audit import AuditTrail
 from .checkers import PolicyChecker, validate_checker_rules
 from .compiler import write_global_block
@@ -20,6 +27,7 @@ from .config import (
     write_default_config,
 )
 from .diagnostics import render_doctor, run_doctor
+from .database import PolicyDatabaseError, sync_database_bundle
 from .extractor import extract_file
 from .hooks import main_hook, prepare_receipt
 from .io_utils import utc_now
@@ -30,10 +38,11 @@ from .review import (
     export_approved_rules,
     load_rules_json,
     read_review_decisions,
+    reconcile_review_decisions,
     write_review,
     write_rules_json,
 )
-from .search import build_sqlite_index, retrieve_runtime_rules
+from .search import SQLitePolicyIndex, build_sqlite_index, retrieve_runtime_rules
 
 
 def _print(value: str = "") -> None:
@@ -105,7 +114,7 @@ def command_prepare(args: argparse.Namespace) -> int:
     if not files:
         raise FileNotFoundError(f"没有找到 Markdown 规范文件：{source_root}")
 
-    rules = []
+    rules: list[PolicyRule] = []
     for path in files:
         scope = args.scope or _infer_scope(path, source_root)
         try:
@@ -122,10 +131,63 @@ def command_prepare(args: argparse.Namespace) -> int:
         )
     candidates_path = resolve_path(home, config, "candidates")
     review_path = resolve_path(home, config, "review")
+    previous_candidates = (
+        load_rules_json(candidates_path) if candidates_path.is_file() else []
+    )
+    previous_decisions = {
+        decision.rule_id: decision
+        for decision in (
+            read_review_decisions(review_path, strict=False)
+            if review_path.is_file()
+            else []
+        )
+    }
+    ai_settings = AISettings.from_config(config)
+    ai_warning = ""
+    try:
+        ai_stats = enrich_rules_cached(
+            rules,
+            ai_settings,
+            resolve_path(home, config, "ai_cache"),
+        )
+    except (PolicyAIError, OSError, ValueError) as error:
+        if ai_settings.required:
+            raise
+        ai_stats = {"enabled": 1, "cached": 0, "generated": 0}
+        ai_warning = str(error)
+
+    preserved, resettable = reconcile_review_decisions(
+        previous_candidates,
+        previous_decisions,
+        rules,
+    )
+    if resettable and not args.reset_decisions:
+        counts: dict[str, int] = {}
+        for decision in resettable:
+            counts[decision.decision] = counts.get(decision.decision, 0) + 1
+        summary = "、".join(
+            f"{name}={count}" for name, count in sorted(counts.items())
+        )
+        raise ValueError(
+            "检测到已修改或已删除规则上的审阅决定（"
+            f"{summary}）。确认丢弃这些决定时请加 --reset-decisions；"
+            f"另外 {len(preserved)} 条未变化规则的决定会继续保留。"
+        )
     write_rules_json(rules, candidates_path, approved_only=False)
-    write_review(rules, review_path)
+    write_review(rules, review_path, decisions=preserved)
     _print(f"已扫描 {len(files)} 个 Markdown 文件。")
-    _print(f"提取到 {len(rules)} 条待审阅候选规则；当前没有任何规则被激活。")
+    _print(
+        f"提取到 {len(rules)} 条候选规则；保留 {len(preserved)} 条既有决定，"
+        f"新增待审 {len(rules) - len(preserved)} 条。"
+    )
+    if ai_stats.get("enabled"):
+        _print(
+            "大模型检索增强："
+            f"缓存 {ai_stats.get('cached', 0)}，"
+            f"新生成 {ai_stats.get('generated', 0)}。"
+        )
+    if ai_warning:
+        _print(f"提示：大模型增强失败，已使用本地解析结果：{ai_warning}")
     _print(f"候选数据：{candidates_path}")
     _print(f"请审阅：{review_path}")
     return 0
@@ -146,12 +208,30 @@ def command_review(args: argparse.Namespace) -> int:
         else resolve_path(home, config, "review")
     )
     rules = load_rules_json(candidates_path)
+    previous_decisions = {
+        decision.rule_id: decision
+        for decision in (
+            read_review_decisions(review_path, strict=False)
+            if review_path.is_file()
+            else []
+        )
+    }
     checker_errors = validate_checker_rules(rules)
     if checker_errors:
         raise ValueError(
             "checker 草案校验失败：\n- " + "\n- ".join(checker_errors[:20])
         )
-    write_review(rules, review_path)
+    preserved, resettable = reconcile_review_decisions(
+        rules,
+        previous_decisions,
+        rules,
+    )
+    if resettable and not args.reset_decisions:
+        raise ValueError(
+            "checker 草案或候选内容已变化，部分既有决定已过期。"
+            "确认丢弃过期决定时请加 --reset-decisions。"
+        )
+    write_review(rules, review_path, decisions=preserved)
     configured = sum(
         1
         for rule in rules
@@ -161,6 +241,7 @@ def command_review(args: argparse.Namespace) -> int:
         )
     )
     _print(f"已重新生成 {len(rules)} 条候选规则的审阅文件。")
+    _print(f"已保留 {len(preserved)} 条未变化规则的既有决定。")
     _print(f"其中 {configured} 条包含可执行 checker 草案；其余规则按 AI review 处理。")
     _print(f"请审阅：{review_path}")
     return 0
@@ -201,6 +282,21 @@ def command_activate(args: argparse.Namespace) -> int:
     limit = int(config.get("review", {}).get("global_core_limit", 40))
     bundle_id = bundle_fingerprint(approved, policy_version)
 
+    ai_settings = AISettings.from_config(config)
+    embedding_warning = ""
+    try:
+        embeddings, embedding_stats = build_embeddings_cached(
+            approved,
+            ai_settings,
+            resolve_path(home, config, "embedding_cache"),
+        )
+    except (PolicyAIError, OSError, ValueError) as error:
+        if ai_settings.required:
+            raise
+        embeddings = {}
+        embedding_stats = {"enabled": 1, "cached": 0, "generated": 0}
+        embedding_warning = str(error)
+
     write_rules_json(
         reviewed,
         reviewed_path,
@@ -220,8 +316,18 @@ def command_activate(args: argparse.Namespace) -> int:
         approved_only=True,
         policy_version=policy_version,
         bundle_id=bundle_id,
+        embeddings=embeddings,
+        embedding_model=ai_settings.embedding_model if embeddings else None,
     )
     write_global_block(approved, global_path, limit=limit)
+    database = sync_database_bundle(
+        config,
+        home,
+        approved,
+        policy_version=policy_version,
+        bundle_id=bundle_id,
+        embeddings=embeddings,
+    )
 
     _print(f"候选规则：{len(candidates)}")
     _print(f"已批准并激活：{len(approved)}")
@@ -229,6 +335,19 @@ def command_activate(args: argparse.Namespace) -> int:
     _print(f"正式规则库：{approved_path}")
     _print(f"检索索引：{index_path}")
     _print(f"全局 MD 复制块：{global_path}")
+    if embedding_stats.get("enabled"):
+        _print(
+            "向量索引："
+            f"缓存 {embedding_stats.get('cached', 0)}，"
+            f"新生成 {embedding_stats.get('generated', 0)}。"
+        )
+    if embedding_warning:
+        _print(f"提示：向量生成失败，已使用纯 BM25 索引：{embedding_warning}")
+    if database.get("enabled"):
+        if database.get("synced"):
+            _print(f"数据库镜像：已同步 {database.get('rule_count', 0)} 条规则。")
+        else:
+            _print(f"提示：数据库镜像未同步：{database.get('error') or database.get('reason')}")
     return 0
 
 
@@ -287,6 +406,18 @@ def command_search(args: argparse.Namespace) -> int:
         block_severities=configured_block_severities,
     )
     code = _read_optional_code(args)
+    ai_settings = AISettings.from_config(config)
+    index_metadata = SQLitePolicyIndex(index_path).validate_metadata(
+        expected_policy_version=policy_version,
+        expected_bundle_id=normalized_bundle_id,
+    )
+    query_embedding, semantic_error = embed_runtime_query(
+        ai_settings,
+        query=args.query or "",
+        file_path=args.file or "",
+        code=code,
+        index_metadata=index_metadata,
+    )
     results = retrieve_runtime_rules(
         index_path,
         checker,
@@ -298,6 +429,9 @@ def command_search(args: argparse.Namespace) -> int:
         categories=args.category,
         expected_policy_version=policy_version,
         expected_bundle_id=normalized_bundle_id,
+        query_embedding=query_embedding,
+        semantic_weight=ai_settings.semantic_weight,
+        min_similarity=ai_settings.min_similarity,
     )
     receipt_payload = None
     if args.receipt:
@@ -343,6 +477,10 @@ def command_search(args: argparse.Namespace) -> int:
             "file": args.file or "",
             "result_count": len(ranked_results),
             "results": ranked_results,
+            "index_backend": (
+                "sqlite-hybrid" if query_embedding is not None else "sqlite"
+            ),
+            "semantic_error": semantic_error,
         }
     if args.json:
         encoded = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -388,7 +526,19 @@ def command_search(args: argparse.Namespace) -> int:
             f"  来源：{source.get('document', '')} / "
             f"{source.get('section') or '未标章节'}"
         )
+        metadata = rule.get("metadata") if isinstance(rule.get("metadata"), dict) else {}
+        for key, label in (
+            ("level", "级别"),
+            ("description", "描述"),
+            ("negative_example", "反例"),
+            ("positive_example", "正例"),
+        ):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                _print(f"  {label}：{value}")
         _print(f"  命中依据：{reason}")
+    if semantic_error:
+        _print(f"提示：语义检索不可用，已自动回退到 BM25：{semantic_error}")
     return 0
 
 
@@ -462,6 +612,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--scope", choices=("company", "department", "project", "unknown")
     )
     prepare.add_argument("--id-prefix", default="AUTO")
+    prepare.add_argument(
+        "--reset-decisions",
+        action="store_true",
+        help="确认丢弃已修改或已删除规则上的既有审阅决定",
+    )
     prepare.set_defaults(handler=command_prepare)
 
     review = subparsers.add_parser(
@@ -469,6 +624,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument("--candidates")
     review.add_argument("--output")
+    review.add_argument(
+        "--reset-decisions",
+        action="store_true",
+        help="确认丢弃候选或 checker 已变化规则上的既有决定",
+    )
     review.set_defaults(handler=command_review)
 
     activate = subparsers.add_parser("activate", help="激活审阅通过的规则")
@@ -520,7 +680,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args) or 0)
-    except (FileNotFoundError, ValueError, KeyError, OSError) as error:
+    except (
+        FileNotFoundError,
+        ValueError,
+        KeyError,
+        OSError,
+        PolicyAIError,
+        PolicyDatabaseError,
+    ) as error:
         sys.stderr.write(f"policykit: {error}\n")
         return 2
 

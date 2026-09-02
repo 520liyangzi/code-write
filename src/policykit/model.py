@@ -129,19 +129,48 @@ class PolicyRule:
         return self.status == "approved"
 
     def searchable_text(self) -> str:
-        """Return all useful search fields without review-only metadata."""
+        """Return the complete, runtime-relevant text for retrieval.
+
+        Structured policy documents keep explanations and positive/negative
+        examples in ``metadata``.  Those fields are deliberately searchable:
+        an edit often contains an API such as ``String.format`` or
+        ``ObjectInputStream.readObject`` that appears only in an example, not
+        in the short normative title.
+        """
+
+        metadata = self.metadata or {}
+        metadata_parts: list[str] = []
+        for key in (
+            "level",
+            "description",
+            "negative_example",
+            "positive_example",
+            "retrieval_intent",
+            "retrieval_hints",
+            "aliases",
+            "code_signals",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                metadata_parts.append(value)
+            elif isinstance(value, (list, tuple, set)):
+                metadata_parts.extend(str(item) for item in value if item)
 
         return "\n".join(
             part
             for part in (
-                self.id,
-                self.title,
-                self.statement,
+                # Repetition supplies lightweight field weighting to both the
+                # in-memory and SQLite BM25 indexes without a schema-specific
+                # tokenizer dependency.
+                "\n".join((self.id,) * 5),
+                "\n".join((self.title,) * 4),
+                "\n".join((self.statement,) * 3),
                 self.source.section,
-                " ".join(self.trigger_terms),
+                "\n".join((" ".join(self.trigger_terms),) * 5),
                 " ".join(self.tags),
                 self.category,
                 self.scope,
+                "\n".join(metadata_parts),
             )
             if part
         )

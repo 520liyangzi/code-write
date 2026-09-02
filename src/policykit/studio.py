@@ -25,9 +25,17 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 import webbrowser
 
+from .ai import (
+    AISettings,
+    PolicyAIError,
+    build_embeddings_cached,
+    embed_runtime_query,
+    enrich_rules_cached,
+)
 from .checkers import PolicyChecker, validate_checker_rules
 from .compiler import write_global_block
 from .config import ensure_layout, resolve_path
+from .database import PolicyDatabaseError, database_status, sync_database_bundle
 from .extractor import extract_file
 from .io_utils import utc_now, write_text
 from .model import PolicyRule, ReviewDecision
@@ -38,6 +46,7 @@ from .review import (
     export_approved_rules,
     load_rules_json,
     read_review_decisions,
+    reconcile_review_decisions,
     render_review,
     review_fingerprint,
     write_rules_json,
@@ -61,6 +70,7 @@ MAX_IMPORT_FILES = 32
 MAX_FILENAME_CHARS = 200
 MAX_EDITED_STATEMENT_CHARS = 200_000
 MAX_NOTES_CHARS = 40_000
+MAX_BULK_DECISIONS = 2_000
 MAX_QUERY_CHARS = 20_000
 MAX_FILE_FIELD_CHARS = 8_000
 MAX_CODE_CHARS = 2_000_000
@@ -383,11 +393,12 @@ class PolicyStudio:
         global_path = self.path("global_block")
         index_ready = index_path.is_file()
         index_error = bundle_error
+        index_metadata: dict[str, str] = {}
         if bundle_error:
             index_ready = False
         if approved_path.is_file() and index_ready:
             try:
-                SQLitePolicyIndex(index_path).validate_metadata(
+                index_metadata = SQLitePolicyIndex(index_path).validate_metadata(
                     expected_policy_version=policy_version,
                     expected_bundle_id=(
                         bundle_id or None
@@ -408,6 +419,7 @@ class PolicyStudio:
                 "global_block",
             )
         }
+        ai_settings = AISettings.from_config(self.config)
         return {
             "ok": True,
             "home": str(self.home),
@@ -423,6 +435,14 @@ class PolicyStudio:
             "index_ready": index_ready,
             "search_index_ready": index_ready,
             "index_error": index_error,
+            "embedding_count": int(index_metadata.get("embedding_count", "0") or 0),
+            "embedding_model": index_metadata.get("embedding_model", ""),
+            "ai": {
+                "provider": ai_settings.provider,
+                "llm_enabled": ai_settings.enrichment_active,
+                "embedding_enabled": ai_settings.embedding_active,
+            },
+            "database": database_status(self.config),
             "activated": approved_path.is_file() and index_ready and global_path.is_file(),
         }
 
@@ -556,6 +576,10 @@ class PolicyStudio:
                 400, "invalid_confirm_reset", "confirm_reset 必须是布尔值"
         )
         with self.mutation_lock:
+            previous_candidates = self._candidate_rules()
+            previous = (
+                self._review_decisions() if self.path("review").is_file() else {}
+            )
             documents = self._documents()
             if not documents:
                 raise StudioError(
@@ -599,14 +623,29 @@ class PolicyStudio:
                     )
                 )
 
-            previous = self._review_decisions() if self.path("review").is_file() else {}
-            resettable_decisions = [
-                decision
-                for decision in previous.values()
-                if decision.decision != "pending_review"
-                or bool(decision.edited_statement)
-                or bool(decision.notes)
-            ]
+            warnings: list[str] = []
+            ai_settings = AISettings.from_config(self.config)
+            ai_stats = {"enabled": 0, "cached": 0, "generated": 0}
+            try:
+                ai_stats = enrich_rules_cached(
+                    rules,
+                    ai_settings,
+                    self.path("ai_cache"),
+                )
+            except (PolicyAIError, OSError, ValueError) as error:
+                if ai_settings.required:
+                    raise StudioError(
+                        503,
+                        "ai_enrichment_failed",
+                        f"大模型规则增强失败：{error}",
+                    ) from error
+                warnings.append(f"大模型规则增强失败，已使用本地解析结果：{error}")
+
+            preserved, resettable_decisions = reconcile_review_decisions(
+                previous_candidates,
+                previous,
+                rules,
+            )
             reset_decision_counts = Counter(
                 decision.decision for decision in resettable_decisions
             )
@@ -614,13 +653,16 @@ class PolicyStudio:
                 raise StudioError(
                     409,
                     "review_decisions_exist",
-                    "已有审批决定；重新提取会重置审批，请确认后重试",
+                    "部分已决定规则已修改或删除；确认丢弃这些旧决定后重试",
                     details={
-                        "decision_counts": dict(sorted(reset_decision_counts.items()))
+                        "decision_counts": dict(
+                            sorted(reset_decision_counts.items())
+                        ),
+                        "preserved_count": len(preserved),
                     },
                 )
 
-            review_text = render_review(rules)
+            review_text = render_review(rules, preserved)
             candidates_path = self.path("candidates")
             review_path = self.path("review")
             write_rules_json(rules, candidates_path, approved_only=False)
@@ -630,6 +672,10 @@ class PolicyStudio:
             "documents_count": len(documents),
             "candidate_count": len(rules),
             "reset_decision_count": len(resettable_decisions),
+            "preserved_decision_count": len(preserved),
+            "new_pending_count": len(rules) - len(preserved),
+            "ai_enrichment": ai_stats,
+            "warnings": warnings,
             "paths": {
                 "candidates": str(candidates_path),
                 "review": str(review_path),
@@ -741,6 +787,103 @@ class PolicyStudio:
             "rule": self._rule_view(rule, persisted),
         }
 
+    def approve_rules(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Atomically approve a reviewed set with optimistic-lock hashes."""
+
+        items = payload.get("rules")
+        if not isinstance(items, list) or not items:
+            raise StudioError(400, "invalid_rules", "rules 必须是非空数组")
+        if len(items) > MAX_BULK_DECISIONS:
+            raise StudioError(
+                413,
+                "too_many_rules",
+                f"单次最多批量批准 {MAX_BULK_DECISIONS} 条规则",
+            )
+        submitted: dict[str, tuple[str, str]] = {}
+        for index, item in enumerate(items):
+            if not isinstance(item, Mapping):
+                raise StudioError(
+                    400, "invalid_rule", f"rules[{index}] 必须是对象"
+                )
+            rule_id = _require_string(
+                item, "rule_id", maximum=256, required=True
+            ).strip()
+            review_hash = _require_string(
+                item, "review_hash", maximum=64, required=True
+            ).casefold()
+            decision_hash = _require_string(
+                item, "decision_hash", maximum=64, required=True
+            ).casefold()
+            if not _REVIEW_HASH_RE.fullmatch(review_hash) or not _REVIEW_HASH_RE.fullmatch(
+                decision_hash
+            ):
+                raise StudioError(
+                    400, "invalid_hash", f"规则 {rule_id} 的审批哈希格式无效"
+                )
+            if rule_id in submitted:
+                raise StudioError(
+                    409, "duplicate_rule", f"批量审批规则重复: {rule_id}"
+                )
+            submitted[rule_id] = (review_hash, decision_hash)
+
+        with self.mutation_lock:
+            candidates = self._candidate_rules(required=True)
+            candidates_by_id = {rule.id: rule for rule in candidates}
+            decisions = self._review_decisions(required=True)
+            for rule_id, (submitted_review, submitted_decision) in submitted.items():
+                rule = candidates_by_id.get(rule_id)
+                if rule is None:
+                    raise StudioError(
+                        404, "rule_not_found", f"候选规则不存在: {rule_id}"
+                    )
+                current_review = review_fingerprint(rule)
+                if not compare_digest(submitted_review, current_review):
+                    raise StudioError(
+                        409,
+                        "stale_review",
+                        f"规则 {rule_id} 已变化，请刷新后重试",
+                    )
+                current = decisions.get(
+                    rule_id,
+                    ReviewDecision(rule_id, review_hash=current_review),
+                )
+                if current.decision != "pending_review":
+                    raise StudioError(
+                        409,
+                        "decision_not_pending",
+                        f"规则 {rule_id} 已有决定，不会被批量覆盖",
+                    )
+                if not compare_digest(
+                    submitted_decision, _decision_fingerprint(current)
+                ):
+                    raise StudioError(
+                        409,
+                        "stale_decision",
+                        f"规则 {rule_id} 已在其他页面更新，请刷新后重试",
+                    )
+            for rule_id in submitted:
+                rule = candidates_by_id[rule_id]
+                current = decisions.get(rule_id)
+                decisions[rule_id] = ReviewDecision(
+                    rule_id=rule_id,
+                    decision="approved",
+                    review_hash=review_fingerprint(rule),
+                    notes=current.notes if current else "",
+                )
+            review_text = render_review(candidates, decisions)
+            review_path = self.path("review")
+            write_text(review_path, review_text)
+            persisted = self._review_decisions(required=True)
+        return {
+            "ok": True,
+            "path": str(review_path),
+            "approved_count": len(submitted),
+            "rules": [
+                self._rule_view(candidates_by_id[rule_id], persisted[rule_id])
+                for rule_id in submitted
+            ],
+        }
+
     def activate(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         policy_version = payload.get("policy_version")
         if policy_version is not None:
@@ -786,6 +929,24 @@ class PolicyStudio:
             global_path = self.path("global_block")
             limit = int(self.config.get("review", {}).get("global_core_limit", 40))
             bundle_id = bundle_fingerprint(approved, policy_version)
+            warnings: list[str] = []
+            ai_settings = AISettings.from_config(self.config)
+            embeddings: dict[str, list[float]] = {}
+            embedding_stats = {"enabled": 0, "cached": 0, "generated": 0}
+            try:
+                embeddings, embedding_stats = build_embeddings_cached(
+                    approved,
+                    ai_settings,
+                    self.path("embedding_cache"),
+                )
+            except (PolicyAIError, OSError, ValueError) as error:
+                if ai_settings.required:
+                    raise StudioError(
+                        503,
+                        "embedding_failed",
+                        f"规则向量生成失败：{error}",
+                    ) from error
+                warnings.append(f"规则向量生成失败，已生成纯 BM25 索引：{error}")
             write_rules_json(
                 reviewed,
                 reviewed_path,
@@ -805,8 +966,29 @@ class PolicyStudio:
                 approved_only=True,
                 policy_version=policy_version,
                 bundle_id=bundle_id,
+                embeddings=embeddings,
+                embedding_model=(
+                    ai_settings.embedding_model if embeddings else None
+                ),
             )
             write_global_block(approved, global_path, limit=limit)
+            try:
+                database = sync_database_bundle(
+                    self.config,
+                    self.home,
+                    approved,
+                    policy_version=policy_version,
+                    bundle_id=bundle_id,
+                    embeddings=embeddings,
+                )
+            except (PolicyDatabaseError, OSError, ValueError) as error:
+                raise StudioError(
+                    503,
+                    "database_sync_failed",
+                    f"数据库同步失败：{error}",
+                ) from error
+            if database.get("error"):
+                warnings.append(str(database["error"]))
         return {
             "ok": True,
             "policy_version": policy_version,
@@ -815,6 +997,9 @@ class PolicyStudio:
                 "approved": len(approved),
                 "not_approved": len(reviewed) - len(approved),
             },
+            "embedding": embedding_stats,
+            "database": database,
+            "warnings": warnings,
             "paths": {
                 "reviewed_rules": str(reviewed_path),
                 "approved_rules": str(approved_path),
@@ -928,6 +1113,33 @@ class PolicyStudio:
             ),
         )
         try:
+            index_metadata = SQLitePolicyIndex(index_path).validate_metadata(
+                expected_policy_version=policy_version,
+                expected_bundle_id=bundle_id or None,
+            )
+        except (OSError, ValueError, sqlite3.DatabaseError) as error:
+            raise StudioError(
+                409,
+                "search_index_invalid",
+                "已激活检索索引损坏或与规则包不一致，请重新激活规则",
+                details={"reason": str(error)},
+            ) from error
+        ai_settings = AISettings.from_config(self.config)
+        try:
+            query_embedding, semantic_error = embed_runtime_query(
+                ai_settings,
+                query=query,
+                file_path=file_path,
+                code=code,
+                index_metadata=index_metadata,
+            )
+        except (PolicyAIError, OSError, ValueError) as error:
+            raise StudioError(
+                503,
+                "semantic_search_failed",
+                f"语义检索查询向量生成失败：{error}",
+            ) from error
+        try:
             results = retrieve_runtime_rules(
                 index_path,
                 checker,
@@ -939,6 +1151,9 @@ class PolicyStudio:
                 categories=categories,
                 expected_policy_version=policy_version,
                 expected_bundle_id=bundle_id or None,
+                query_embedding=query_embedding,
+                semantic_weight=ai_settings.semantic_weight,
+                min_similarity=ai_settings.min_similarity,
             )
         except (
             OSError,
@@ -957,8 +1172,12 @@ class PolicyStudio:
             "status": "matched" if results else "no_applicable_rule",
             "policy_version": policy_version,
             "bundle_id": bundle_id,
-            "index_backend": "sqlite",
+            "index_backend": (
+                "sqlite-hybrid" if query_embedding is not None else "sqlite"
+            ),
             "index_path": str(index_path),
+            "semantic_used": query_embedding is not None,
+            "semantic_error": semantic_error,
             "result_count": len(results),
             "results": results,
         }
@@ -1147,6 +1366,7 @@ class PolicyStudioHandler(BaseHTTPRequestHandler):
             "/api/documents/import": studio.import_documents,
             "/api/prepare": studio.prepare,
             "/api/review/decision": studio.save_decision,
+            "/api/review/approve": studio.approve_rules,
             "/api/activate": studio.activate,
             "/api/search": studio.search,
         }

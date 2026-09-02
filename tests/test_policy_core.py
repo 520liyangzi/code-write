@@ -20,6 +20,7 @@ from policykit.search import (
     SQLitePolicyIndex,
     build_sqlite_index,
     retrieve_runtime_rules,
+    tokenize,
 )
 
 
@@ -39,6 +40,115 @@ SAMPLE = """# Java 编码规范
 
 
 class PolicyCoreTests(unittest.TestCase):
+    def test_structured_rules_keep_complete_fields_and_retrieve_by_code_scene(self) -> None:
+        sample_path = (
+            Path(__file__).resolve().parents[1]
+            / "examples"
+            / "test-policies"
+            / "Java结构化编码规范-仅测试.md"
+        )
+        rules = extract_markdown(
+            sample_path.read_text(encoding="utf-8"),
+            sample_path.name,
+            scope="company",
+        )
+        self.assertEqual(
+            {"G.NAM.01", "G.CMT.02", "G.SER.01", "G.EDV.02"},
+            {rule.id for rule in rules},
+        )
+        format_rule = next(rule for rule in rules if rule.id == "G.EDV.02")
+        self.assertEqual("要求", format_rule.metadata["level"])
+        self.assertIn("攻击者", format_rule.metadata["description"])
+        self.assertIn("String.format", format_rule.metadata["negative_example"])
+        self.assertIn("my format: %s", format_rule.metadata["positive_example"])
+        self.assertNotIn("```", format_rule.metadata["positive_example"])
+        self.assertGreater(format_rule.source.line_end, format_rule.source.line_start)
+        rendered = render_review([format_rule])
+        self.assertIn("- 级别：`要求`", rendered)
+        self.assertIn("#### 反例", rendered)
+        self.assertIn("#### 正例", rendered)
+
+        for rule in rules:
+            rule.status = "approved"
+        index = PolicySearchIndex(rules)
+        scenarios = (
+            (
+                "创建订单服务类",
+                "src/main/java/OrderService.java",
+                "public class OrderService {}",
+                "G.CMT.02",
+            ),
+            (
+                "解析请求里的对象",
+                "src/main/java/Input.java",
+                "new ObjectInputStream(request.getInputStream()).readObject()",
+                "G.SER.01",
+            ),
+            (
+                "拼装输出文字",
+                "src/main/java/Format.java",
+                'String.format(request.getParameter("format"), value)',
+                "G.EDV.02",
+            ),
+            (
+                "新增用户名称变量",
+                "src/main/java/User.java",
+                'String User_Name = "x";',
+                "G.NAM.01",
+            ),
+        )
+        for query, file_path, code, expected_id in scenarios:
+            with self.subTest(expected_id=expected_id):
+                matches = index.search(query, file_path, code, limit=10)
+                self.assertEqual([expected_id], [item.rule_id for item in matches])
+                cards = retrieve_runtime_rules(
+                    index,
+                    PolicyChecker(rules),
+                    query=query,
+                    file_path=file_path,
+                    code=code,
+                    limit=10,
+                )
+                self.assertEqual([expected_id], [card["id"] for card in cards])
+
+        self.assertNotIn("格", tokenize("格式化字符串"))
+
+    def test_sqlite_hybrid_search_can_recall_semantic_only_match(self) -> None:
+        rules = [
+            PolicyRule(
+                id="FORMAT-RULE",
+                title="格式化字符串",
+                statement="格式模板不得来自外部输入",
+                source=SourceRef("security.md"),
+                status="approved",
+            ),
+            PolicyRule(
+                id="NAME-RULE",
+                title="变量命名",
+                statement="变量采用小驼峰命名",
+                source=SourceRef("coding.md"),
+                status="approved",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = build_sqlite_index(
+                rules,
+                Path(directory) / "rules.db",
+                embeddings={"FORMAT-RULE": [1.0, 0.0], "NAME-RULE": [0.0, 1.0]},
+                embedding_model="test-embedding",
+            )
+            index = SQLitePolicyIndex(path)
+            self.assertEqual("2", index.read_metadata()["embedding_count"])
+            results = index.search(
+                query="生成一段输出",
+                query_embedding=[0.99, 0.01],
+                semantic_weight=0.8,
+                min_similarity=0.2,
+            )
+            self.assertTrue(results)
+            self.assertEqual("FORMAT-RULE", results[0].rule_id)
+            self.assertTrue(any("语义相似度" in reason for reason in results[0].reasons))
+
     def test_extract_review_activate_and_search(self) -> None:
         rules = extract_markdown(SAMPLE, "Java编码规范.md", scope="company")
         self.assertEqual(3, len(rules))

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .ai import AISettings
 from .config import resolve_path
+from .database import DatabaseSettings
 from .model import PolicyRule
 from .review import bundle_fingerprint
 from .search import SQLitePolicyIndex
@@ -101,6 +104,50 @@ def run_doctor(home: Path, config: Mapping[str, Any]) -> list[dict[str, str]]:
                 "规则库已存在但索引缺失" if approved.exists() else "尚未生成",
             )
         )
+
+    ai = AISettings.from_config(config)
+    if ai.enrichment_active or ai.embedding_active:
+        problems: list[str] = []
+        if ai.provider not in {"openai", "openai-compatible"}:
+            problems.append(f"provider 不支持：{ai.provider}")
+        if ai.enrichment_active and not ai.llm_model:
+            problems.append("未配置 LLM model")
+        if ai.embedding_active and not ai.embedding_model:
+            problems.append("未配置 embedding model")
+        if not os.environ.get(ai.api_key_env, "").strip():
+            problems.append(f"环境变量 {ai.api_key_env} 未设置")
+        results.append(
+            _result(
+                "AI 检索增强",
+                ("fail" if ai.required else "warn") if problems else "pass",
+                "；".join(problems)
+                if problems
+                else "配置完整（未发起网络请求）",
+            )
+        )
+    else:
+        results.append(_result("AI 检索增强", "skip", "未启用，使用 BM25"))
+
+    database = DatabaseSettings.from_config(config)
+    if database.enabled:
+        problems = []
+        if database.adapter not in {"sqlite", "custom"}:
+            problems.append(f"adapter 不支持：{database.adapter}")
+        if not database.url:
+            problems.append("数据库 URL 未配置")
+        if database.adapter == "custom" and not database.custom_factory:
+            problems.append("custom_factory 未配置")
+        results.append(
+            _result(
+                "数据库接口",
+                ("fail" if database.required else "warn") if problems else "pass",
+                "；".join(problems)
+                if problems
+                else f"{database.adapter} 已配置（将在 activate 时同步）",
+            )
+        )
+    else:
+        results.append(_result("数据库接口", "skip", "未启用（可选能力）"))
 
     codegraph = config.get("codegraph", {})
     if codegraph.get("enabled"):
