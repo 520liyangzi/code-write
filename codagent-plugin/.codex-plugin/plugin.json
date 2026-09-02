@@ -1,0 +1,19 @@
+{
+  "name": "java-policy-kit",
+  "version": "0.1.0",
+  "description": "Load approved Java standards on demand, enforce configured checks, and record per-edit policy evidence.",
+  "author": {
+    "name": "Internal Java Platform Team"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Java Policy Kit",
+    "shortDescription": "Java standards, checks, and edit traceability.",
+    "longDescription": "Loads reviewed Java coding, security, performance, and project policies only when relevant; validates configured rules and records what governed each edit.",
+    "developerName": "Internal Java Platform Team",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": "Implement this Java change using the approved policy workflow and show the policy trace."
+  }
+}
+

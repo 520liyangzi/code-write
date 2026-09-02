@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codagent-java-policy"
+version = "0.1.0"
+description = "Local Java policy loading, review, checking, and traceability for Codagent-compatible coding agents."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+policykit = "policykit.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

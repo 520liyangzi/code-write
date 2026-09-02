@@ -1,0 +1,51 @@
+{
+  "description": "Java Policy Kit hooks. install.ps1 replaces command placeholders with absolute paths.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__POLICYKIT_PRE_EDIT_COMMAND__",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Shell|PowerShell|Command|exec_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__POLICYKIT_PRE_SHELL_COMMAND__",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__POLICYKIT_POST_EDIT_COMMAND__",
+            "timeout": 45
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__POLICYKIT_STOP_COMMAND__",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

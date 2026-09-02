@@ -1,0 +1,12 @@
+.idea/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.policy-work/
+policy-sources/

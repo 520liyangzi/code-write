@@ -1,0 +1,8 @@
+{
+  "name": "java-policy-kit",
+  "version": "0.1.0",
+  "description": "Load approved Java standards on demand, enforce configured checks, and record per-edit policy evidence.",
+  "author": {
+    "name": "Internal Java Platform Team"
+  }
+}

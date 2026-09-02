@@ -1,0 +1,8 @@
+# 仅作可选集成说明，不会被 Java Policy Kit 自动加载。
+# 当前 MVP 不要求 CodeGraph；如果 Codagent 已经暴露 CodeGraph MCP/Skill，
+# java-policy Skill 会在确有帮助时直接调用已有工具，无需重新建索引。
+enabled: false
+mode: existing_codagent_tool
+tool_name: "请填写公司 Codagent 中实际可用的工具名"
+required: false
+audit_label: codegraph

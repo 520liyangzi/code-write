@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "paths": {
+    "source_dir": "policy-sources",
+    "work_dir": ".policy-work",
+    "candidates": ".policy-work/candidates.json",
+    "review": ".policy-work/REVIEW_ME.md",
+    "approved_rules": ".policy-work/approved-rules.json",
+    "search_index": ".policy-work/search-index.db",
+    "global_block": ".policy-work/GLOBAL_MD_BLOCK.md",
+    "receipts_dir": ".policy-work/receipts",
+    "audit_dir": ".policy-work/audit"
+  },
+  "runtime": {
+    "require_receipt": true,
+    "receipt_ttl_seconds": 900,
+    "fail_closed": true,
+    "file_extensions": [".java", ".xml", ".yml", ".yaml", ".properties"],
+    "max_rules_per_edit": 20,
+    "max_context_chars": 6000,
+    "max_cli_output_chars": 8000,
+    "block_severities": ["blocker", "major"],
+    "ai_review_blocks_stop": true
+  },
+  "review": {
+    "global_core_limit": 40,
+    "activate_only_approved": true
+  },
+  "codegraph": {
+    "enabled": false,
+    "mode": "disabled",
+    "command": "",
+    "mcp_server": "",
+    "tool_map": {},
+    "notes": "可选能力。除非明确配置，否则不会连接或重建任何 CodeGraph 索引。"
+  }
+}
