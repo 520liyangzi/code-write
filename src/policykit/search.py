@@ -130,12 +130,190 @@ class SearchResult:
         raise KeyError(key)
 
 
+class PolicyIndexMetadataError(ValueError):
+    """Raised when a runtime index does not match its approved rule bundle."""
+
+
+def _normalized_bundle_id(value: str | None, *, required: bool = False) -> str:
+    normalized = str(value or "").strip().casefold()
+    if not normalized and not required:
+        return ""
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        raise PolicyIndexMetadataError("bundle_id 必须是 64 位十六进制字符串")
+    return normalized
+
+
+def _validate_metadata_values(
+    metadata: Mapping[str, str],
+    *,
+    expected_policy_version: str | None = None,
+    expected_bundle_id: str | None = None,
+) -> dict[str, str]:
+    values = {str(key): str(value) for key, value in metadata.items()}
+    if values.get("schema_version") != "1":
+        raise PolicyIndexMetadataError(
+            f"不支持的检索索引 schema_version：{values.get('schema_version') or '缺失'}"
+        )
+
+    actual_bundle_id = values.get("bundle_id", "")
+    if actual_bundle_id:
+        values["bundle_id"] = _normalized_bundle_id(actual_bundle_id)
+
+    if expected_policy_version is not None:
+        expected_version = str(expected_policy_version).strip()
+        actual_version = values.get("policy_version", "")
+        if actual_version != expected_version:
+            raise PolicyIndexMetadataError(
+                "检索索引 policy_version 与已批准规则不一致："
+                f"expected={expected_version!r}, actual={actual_version or '缺失'!r}"
+            )
+    if expected_bundle_id is not None:
+        expected_bundle = _normalized_bundle_id(expected_bundle_id, required=True)
+        actual_bundle = values.get("bundle_id", "")
+        if actual_bundle != expected_bundle:
+            raise PolicyIndexMetadataError(
+                "检索索引 bundle_id 与已批准规则不一致："
+                f"expected={expected_bundle}, actual={actual_bundle or '缺失'}"
+            )
+    return values
+
+
 def _scope_set(scopes: Iterable[str] | str | None) -> set[str] | None:
     if scopes is None:
         return None
     if isinstance(scopes, str):
         return {scopes.casefold()}
     return {str(scope).casefold() for scope in scopes}
+
+
+def _query_terms(
+    query: str, file_path: str, code: str
+) -> tuple[list[str], list[str], list[str], Counter[str]]:
+    query_tokens = tokenize(query)
+    path_tokens = tokenize(file_path)
+    code_tokens = tokenize(code)
+    weighted: Counter[str] = Counter()
+    weighted.update({term: 3.0 for term in query_tokens})
+    weighted.update({term: 2.0 for term in path_tokens})
+    weighted.update({term: 1.0 for term in code_tokens})
+    return query_tokens, path_tokens, code_tokens, weighted
+
+
+def _score_results(
+    rules: Mapping[str, PolicyRule],
+    term_frequencies: Mapping[str, Counter[str]],
+    document_frequencies: Mapping[str, int],
+    document_lengths: Mapping[str, int],
+    *,
+    total_documents: int,
+    average_length: float,
+    query: str,
+    file_path: str,
+    code: str,
+    limit: int,
+    scopes: Iterable[str] | str | None,
+    categories: Iterable[str] | str | None,
+) -> list[SearchResult]:
+    """Score candidate documents using corpus-wide BM25 statistics."""
+
+    if limit <= 0 or not rules or total_documents <= 0:
+        return []
+    query_tokens, path_tokens, code_tokens, weighted_query = _query_terms(
+        query, file_path, code
+    )
+    if not weighted_query:
+        return []
+
+    requested_scopes = _scope_set(scopes)
+    requested_categories = _scope_set(categories)
+    normalized_query = unicodedata.normalize("NFKC", query).casefold()
+    normalized_path = unicodedata.normalize("NFKC", file_path).casefold()
+    normalized_code = unicodedata.normalize("NFKC", code).casefold()
+    results: list[SearchResult] = []
+
+    for rule_id, rule in rules.items():
+        if requested_scopes and rule.scope.casefold() not in requested_scopes:
+            continue
+        if requested_categories and rule.category.casefold() not in requested_categories:
+            continue
+        frequencies = term_frequencies.get(rule_id, Counter())
+        matched = [term for term in weighted_query if term in frequencies]
+        if not matched:
+            continue
+
+        document_length = document_lengths.get(rule_id, 1)
+        score = 0.0
+        for term in matched:
+            document_frequency = int(document_frequencies.get(term, 0))
+            inverse_frequency = math.log(
+                1.0
+                + (total_documents - document_frequency + 0.5)
+                / (document_frequency + 0.5)
+            )
+            frequency = frequencies[term]
+            normalization = 1.5 * (
+                1.0
+                - 0.75
+                + 0.75 * document_length / max(average_length, 1.0)
+            )
+            score += (
+                weighted_query[term]
+                * inverse_frequency
+                * frequency
+                * 2.5
+                / (frequency + normalization)
+            )
+
+        reasons: list[str] = []
+        rule_id_folded = rule.id.casefold()
+        if normalized_query and (
+            normalized_query == rule_id_folded or rule_id_folded in normalized_query
+        ):
+            score += 12.0
+            reasons.append(f"命中规则 ID：{rule.id}")
+
+        query_matches = [term for term in query_tokens if term in frequencies]
+        path_matches = [term for term in path_tokens if term in frequencies]
+        code_matches = [term for term in code_tokens if term in frequencies]
+        if query_matches:
+            reasons.append("命中任务词：" + "、".join(query_matches[:8]))
+        if path_matches:
+            reasons.append("命中文件路径：" + "、".join(path_matches[:6]))
+        if code_matches:
+            reasons.append("命中代码特征：" + "、".join(code_matches[:8]))
+
+        trigger_hits: list[str] = []
+        for trigger in rule.trigger_terms:
+            normalized_trigger = unicodedata.normalize("NFKC", trigger).casefold()
+            if normalized_trigger and (
+                normalized_trigger in normalized_query
+                or normalized_trigger in normalized_path
+                or normalized_trigger in normalized_code
+            ):
+                trigger_hits.append(trigger)
+        if trigger_hits:
+            score += 2.5 * len(trigger_hits)
+            reasons.append("命中显式触发项：" + "、".join(trigger_hits[:6]))
+
+        results.append(
+            SearchResult(
+                rule=rule,
+                score=round(score, 6),
+                reasons=tuple(reasons or ("词元相关",)),
+                matched_terms=tuple(matched),
+            )
+        )
+
+    results.sort(
+        key=lambda item: (
+            -item.score,
+            {"blocker": 0, "major": 1, "advisory": 2}.get(
+                item.rule.severity, 3
+            ),
+            item.rule.id,
+        )
+    )
+    return results[:limit]
 
 
 class PolicySearchIndex:
@@ -146,8 +324,12 @@ class PolicySearchIndex:
         rules: Iterable[PolicyRule] = (),
         *,
         approved_only: bool = True,
+        policy_version: str | None = None,
+        bundle_id: str | None = None,
     ) -> None:
         self.approved_only = approved_only
+        self.policy_version = str(policy_version or "").strip()
+        self.bundle_id = _normalized_bundle_id(bundle_id) if bundle_id else ""
         self._rules: dict[str, PolicyRule] = {}
         self._term_frequencies: dict[str, Counter[str]] = {}
         self._document_frequencies: Counter[str] = Counter()
@@ -210,117 +392,52 @@ class PolicySearchIndex:
     ) -> list[SearchResult]:
         """Search by task language, actual file path, and/or code features."""
 
-        if limit <= 0 or not self._rules:
-            return []
-        query_tokens = tokenize(query)
-        path_tokens = tokenize(file_path)
-        code_tokens = tokenize(code)
-        if not query_tokens and not path_tokens and not code_tokens:
-            return []
-
-        weighted_query: Counter[str] = Counter()
-        weighted_query.update({term: 3.0 for term in query_tokens})
-        weighted_query.update({term: 2.0 for term in path_tokens})
-        weighted_query.update({term: 1.0 for term in code_tokens})
-
-        requested_scopes = _scope_set(scopes)
-        requested_categories = _scope_set(categories)
-        total_documents = len(self._rules)
-        results: list[SearchResult] = []
-        normalized_query = unicodedata.normalize("NFKC", query).casefold()
-        normalized_path = unicodedata.normalize("NFKC", file_path).casefold()
-        normalized_code = unicodedata.normalize("NFKC", code).casefold()
-
-        for rule_id, rule in self._rules.items():
-            if requested_scopes and rule.scope.casefold() not in requested_scopes:
-                continue
-            if (
-                requested_categories
-                and rule.category.casefold() not in requested_categories
-            ):
-                continue
-            frequencies = self._term_frequencies[rule_id]
-            matched = [term for term in weighted_query if term in frequencies]
-            if not matched:
-                continue
-
-            document_length = self._document_lengths[rule_id]
-            score = 0.0
-            for term in matched:
-                document_frequency = self._document_frequencies[term]
-                inverse_frequency = math.log(
-                    1.0
-                    + (total_documents - document_frequency + 0.5)
-                    / (document_frequency + 0.5)
-                )
-                frequency = frequencies[term]
-                normalization = 1.5 * (
-                    1.0
-                    - 0.75
-                    + 0.75 * document_length / max(self._average_length, 1.0)
-                )
-                score += (
-                    weighted_query[term]
-                    * inverse_frequency
-                    * frequency
-                    * 2.5
-                    / (frequency + normalization)
-                )
-
-            reasons: list[str] = []
-            rule_id_folded = rule.id.casefold()
-            if normalized_query and (
-                normalized_query == rule_id_folded
-                or rule_id_folded in normalized_query
-            ):
-                score += 12.0
-                reasons.append(f"命中规则 ID：{rule.id}")
-
-            query_matches = [term for term in query_tokens if term in frequencies]
-            path_matches = [term for term in path_tokens if term in frequencies]
-            code_matches = [term for term in code_tokens if term in frequencies]
-            if query_matches:
-                reasons.append("命中任务词：" + "、".join(query_matches[:8]))
-            if path_matches:
-                reasons.append("命中文件路径：" + "、".join(path_matches[:6]))
-            if code_matches:
-                reasons.append("命中代码特征：" + "、".join(code_matches[:8]))
-
-            trigger_hits: list[str] = []
-            for trigger in rule.trigger_terms:
-                normalized_trigger = unicodedata.normalize("NFKC", trigger).casefold()
-                if normalized_trigger and (
-                    normalized_trigger in normalized_query
-                    or normalized_trigger in normalized_path
-                    or normalized_trigger in normalized_code
-                ):
-                    trigger_hits.append(trigger)
-            if trigger_hits:
-                score += 2.5 * len(trigger_hits)
-                reasons.append("命中显式触发项：" + "、".join(trigger_hits[:6]))
-
-            results.append(
-                SearchResult(
-                    rule=rule,
-                    score=round(score, 6),
-                    reasons=tuple(reasons or ("词元相关",)),
-                    matched_terms=tuple(matched),
-                )
-            )
-
-        results.sort(
-            key=lambda item: (
-                -item.score,
-                {"blocker": 0, "major": 1, "advisory": 2}.get(
-                    item.rule.severity, 3
-                ),
-                item.rule.id,
-            )
+        return _score_results(
+            self._rules,
+            self._term_frequencies,
+            self._document_frequencies,
+            self._document_lengths,
+            total_documents=len(self._rules),
+            average_length=self._average_length,
+            query=query,
+            file_path=file_path,
+            code=code,
+            limit=limit,
+            scopes=scopes,
+            categories=categories,
         )
-        return results[:limit]
+
+    def read_metadata(self) -> dict[str, str]:
+        metadata = {
+            "schema_version": "1",
+            "rule_count": str(self.rule_count),
+        }
+        if self.policy_version:
+            metadata["policy_version"] = self.policy_version
+        if self.bundle_id:
+            metadata["bundle_id"] = self.bundle_id
+        return metadata
+
+    def validate_metadata(
+        self,
+        *,
+        expected_policy_version: str | None = None,
+        expected_bundle_id: str | None = None,
+    ) -> dict[str, str]:
+        return _validate_metadata_values(
+            self.read_metadata(),
+            expected_policy_version=expected_policy_version,
+            expected_bundle_id=expected_bundle_id,
+        )
 
     def to_sqlite(self, path: str | Path) -> Path:
-        return build_sqlite_index(self._rules.values(), path, approved_only=False)
+        return build_sqlite_index(
+            self._rules.values(),
+            path,
+            approved_only=False,
+            policy_version=self.policy_version or None,
+            bundle_id=self.bundle_id or None,
+        )
 
     @classmethod
     def from_json(
@@ -333,6 +450,16 @@ class PolicySearchIndex:
         return cls(
             (PolicyRule.from_dict(value) for value in values),
             approved_only=approved_only,
+            policy_version=(
+                str(payload.get("policy_version") or "")
+                if isinstance(payload, Mapping)
+                else None
+            ),
+            bundle_id=(
+                str(payload.get("bundle_id") or "")
+                if isinstance(payload, Mapping)
+                else None
+            ),
         )
 
 
@@ -341,6 +468,8 @@ def build_sqlite_index(
     path: str | Path,
     *,
     approved_only: bool = True,
+    policy_version: str | None = None,
+    bundle_id: str | None = None,
 ) -> Path:
     """Build an atomic, disposable SQLite postings index."""
 
@@ -351,6 +480,8 @@ def build_sqlite_index(
         temporary.unlink()
 
     selected = [rule for rule in rules if not approved_only or rule.active]
+    normalized_policy_version = str(policy_version or "").strip()
+    normalized_bundle_id = _normalized_bundle_id(bundle_id) if bundle_id else ""
     connection = sqlite3.connect(temporary)
     try:
         connection.executescript(
@@ -376,9 +507,16 @@ def build_sqlite_index(
             CREATE INDEX postings_rule_id_idx ON postings(rule_id);
             """
         )
+        metadata = [
+            ("schema_version", "1"),
+            ("rule_count", str(len(selected))),
+        ]
+        if normalized_policy_version:
+            metadata.append(("policy_version", normalized_policy_version))
+        if normalized_bundle_id:
+            metadata.append(("bundle_id", normalized_bundle_id))
         connection.executemany(
-            "INSERT INTO metadata(key, value) VALUES (?, ?)",
-            (("schema_version", "1"), ("rule_count", str(len(selected)))),
+            "INSERT INTO metadata(key, value) VALUES (?, ?)", metadata
         )
         for rule in selected:
             connection.execute(
@@ -415,6 +553,47 @@ class SQLitePolicyIndex:
         if not self.path.is_file():
             raise FileNotFoundError(self.path)
 
+    def read_metadata(self) -> dict[str, str]:
+        connection = sqlite3.connect(self.path)
+        try:
+            rows = connection.execute("SELECT key, value FROM metadata").fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise PolicyIndexMetadataError(f"无法读取检索索引 metadata：{exc}") from exc
+        finally:
+            connection.close()
+        return {str(key): str(value) for key, value in rows}
+
+    def validate_metadata(
+        self,
+        *,
+        expected_policy_version: str | None = None,
+        expected_bundle_id: str | None = None,
+    ) -> dict[str, str]:
+        metadata = _validate_metadata_values(
+            self.read_metadata(),
+            expected_policy_version=expected_policy_version,
+            expected_bundle_id=expected_bundle_id,
+        )
+        try:
+            expected_count = int(metadata.get("rule_count", ""))
+        except ValueError as exc:
+            raise PolicyIndexMetadataError("检索索引 rule_count metadata 无效") from exc
+        connection = sqlite3.connect(self.path)
+        try:
+            actual_count = int(
+                connection.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+            )
+        except sqlite3.DatabaseError as exc:
+            raise PolicyIndexMetadataError(f"检索索引 rules 表无效：{exc}") from exc
+        finally:
+            connection.close()
+        if actual_count != expected_count:
+            raise PolicyIndexMetadataError(
+                "检索索引 rule_count 不一致："
+                f"metadata={expected_count}, actual={actual_count}"
+            )
+        return metadata
+
     def search(
         self,
         query: str = "",
@@ -424,46 +603,115 @@ class SQLitePolicyIndex:
         scopes: Iterable[str] | str | None = None,
         *,
         categories: Iterable[str] | str | None = None,
+        expected_policy_version: str | None = None,
+        expected_bundle_id: str | None = None,
     ) -> list[SearchResult]:
-        terms = _ordered_unique(
-            (*tokenize(query), *tokenize(file_path), *tokenize(code))
+        self.validate_metadata(
+            expected_policy_version=expected_policy_version,
+            expected_bundle_id=expected_bundle_id,
         )
-        # Stay below conservative SQLite bind-variable limits when a whole
-        # source file is supplied by a hook. Task/path terms occur first and
-        # therefore retain priority.
-        terms = terms[:900]
-        if not terms or limit <= 0:
+        query_tokens, path_tokens, code_tokens, weighted_query = _query_terms(
+            query, file_path, code
+        )
+        terms = _ordered_unique((*query_tokens, *path_tokens, *code_tokens))
+        if not weighted_query or limit <= 0:
             return []
-
-        placeholders = ",".join("?" for _ in terms)
         requested_scopes = _scope_set(scopes)
         requested_categories = _scope_set(categories)
         connection = sqlite3.connect(self.path)
         try:
+            # A TEMP table avoids SQLite bind-variable limits without changing
+            # the persistent, rebuildable index.
+            connection.execute(
+                "CREATE TEMP TABLE runtime_query_terms (token TEXT PRIMARY KEY)"
+            )
+            connection.executemany(
+                "INSERT INTO runtime_query_terms(token) VALUES (?)",
+                ((term,) for term in terms),
+            )
             rows = connection.execute(
-                "SELECT DISTINCT r.payload "
-                "FROM rules AS r JOIN postings AS p ON p.rule_id = r.rule_id "
-                f"WHERE p.token IN ({placeholders})",
-                terms,
+                "SELECT DISTINCT r.rule_id, r.payload "
+                "FROM rules AS r "
+                "JOIN postings AS p ON p.rule_id = r.rule_id "
+                "JOIN runtime_query_terms AS q ON q.token = p.token"
             ).fetchall()
+
+            rules: dict[str, PolicyRule] = {}
+            for rule_id, payload in rows:
+                rule = PolicyRule.from_dict(json.loads(payload))
+                if requested_scopes and rule.scope.casefold() not in requested_scopes:
+                    continue
+                if (
+                    requested_categories
+                    and rule.category.casefold() not in requested_categories
+                ):
+                    continue
+                rules[str(rule_id)] = rule
+            if not rules:
+                return []
+
+            connection.execute(
+                "CREATE TEMP TABLE runtime_candidates (rule_id TEXT PRIMARY KEY)"
+            )
+            connection.executemany(
+                "INSERT INTO runtime_candidates(rule_id) VALUES (?)",
+                ((rule_id,) for rule_id in rules),
+            )
+            term_frequencies: dict[str, Counter[str]] = {
+                rule_id: Counter() for rule_id in rules
+            }
+            for rule_id, token, frequency in connection.execute(
+                "SELECT p.rule_id, p.token, p.term_frequency "
+                "FROM postings AS p "
+                "JOIN runtime_query_terms AS q ON q.token = p.token "
+                "JOIN runtime_candidates AS c ON c.rule_id = p.rule_id"
+            ):
+                term_frequencies[str(rule_id)][str(token)] = int(frequency)
+
+            document_frequencies = {
+                str(token): int(count)
+                for token, count in connection.execute(
+                    "SELECT p.token, COUNT(*) "
+                    "FROM postings AS p "
+                    "JOIN runtime_query_terms AS q ON q.token = p.token "
+                    "GROUP BY p.token"
+                )
+            }
+            document_lengths = {
+                str(rule_id): max(1, int(length or 0))
+                for rule_id, length in connection.execute(
+                    "SELECT p.rule_id, SUM(p.term_frequency) "
+                    "FROM postings AS p "
+                    "JOIN runtime_candidates AS c ON c.rule_id = p.rule_id "
+                    "GROUP BY p.rule_id"
+                )
+            }
+            total_documents = int(
+                connection.execute("SELECT COUNT(*) FROM rules").fetchone()[0]
+            )
+            average_row = connection.execute(
+                "SELECT AVG(CASE WHEN document_length < 1 THEN 1 "
+                "ELSE document_length END) "
+                "FROM ("
+                "SELECT r.rule_id, COALESCE(SUM(p.term_frequency), 0) "
+                "AS document_length "
+                "FROM rules AS r LEFT JOIN postings AS p "
+                "ON p.rule_id = r.rule_id GROUP BY r.rule_id"
+                ")"
+            ).fetchone()
+            average_length = float(average_row[0] or 0.0)
+        except sqlite3.DatabaseError as exc:
+            raise PolicyIndexMetadataError(f"检索索引查询失败：{exc}") from exc
         finally:
             connection.close()
 
-        rules = []
-        for (payload,) in rows:
-            rule = PolicyRule.from_dict(json.loads(payload))
-            if requested_scopes and rule.scope.casefold() not in requested_scopes:
-                continue
-            if (
-                requested_categories
-                and rule.category.casefold() not in requested_categories
-            ):
-                continue
-            rules.append(rule)
-
-        # SQLite narrows candidates; the shared in-memory scorer preserves one
-        # relevance implementation and consistent explanations.
-        return PolicySearchIndex(rules, approved_only=False).search(
+        return _score_results(
+            rules,
+            term_frequencies,
+            document_frequencies,
+            document_lengths,
+            total_documents=total_documents,
+            average_length=average_length,
             query=query,
             file_path=file_path,
             code=code,
@@ -473,11 +721,147 @@ class SQLitePolicyIndex:
         )
 
 
+def _search_result_card(result: SearchResult) -> dict[str, Any]:
+    return {
+        "rule": result.rule.to_dict(),
+        "id": result.rule.id,
+        "title": result.rule.title,
+        "statement": result.rule.statement,
+        "severity": result.rule.severity,
+        "category": result.rule.category,
+        "source": " / ".join(
+            part
+            for part in (result.rule.source.document, result.rule.source.section)
+            if part
+        ),
+        "checkers": [],
+        "score": result.score,
+        "reasons": list(result.reasons),
+        "applicable": False,
+    }
+
+
+def retrieve_runtime_rules(
+    search_index: str | Path | PolicySearchIndex | SQLitePolicyIndex,
+    checker: Any,
+    *,
+    query: str = "",
+    file_path: str = "",
+    code: str = "",
+    limit: int = 20,
+    scopes: Iterable[str] | str | None = None,
+    categories: Iterable[str] | str | None = None,
+    expected_policy_version: str | None = None,
+    expected_bundle_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Merge ranked retrieval with every directly applicable checker rule.
+
+    Direct path/content/checker applicability is safety-relevant and therefore
+    takes precedence over the normal ranking limit. If more directly
+    applicable rules exist than ``limit``, all of them are returned.
+    """
+
+    if limit <= 0:
+        return []
+    index = (
+        search_index
+        if isinstance(search_index, (PolicySearchIndex, SQLitePolicyIndex))
+        else SQLitePolicyIndex(search_index)
+    )
+    index.validate_metadata(
+        expected_policy_version=expected_policy_version,
+        expected_bundle_id=expected_bundle_id,
+    )
+    if isinstance(index, SQLitePolicyIndex):
+        matches = index.search(
+            query=query,
+            file_path=file_path,
+            code=code,
+            limit=limit,
+            scopes=scopes,
+            categories=categories,
+            expected_policy_version=expected_policy_version,
+            expected_bundle_id=expected_bundle_id,
+        )
+    else:
+        matches = index.search(
+            query=query,
+            file_path=file_path,
+            code=code,
+            limit=limit,
+            scopes=scopes,
+            categories=categories,
+        )
+    ranked_cards = [_search_result_card(result) for result in matches]
+    ranked_by_id = {str(card["id"]): card for card in ranked_cards}
+    applicable_cards = checker.applicable_rules(
+        file_path, f"{query}\n{code}", max_rules=None
+    )
+    checker_rules = {
+        str(rule.get("id") or "").strip(): dict(rule)
+        for rule in (getattr(checker, "rules", ()) or ())
+        if isinstance(rule, Mapping) and str(rule.get("id") or "").strip()
+    }
+    requested_scopes = _scope_set(scopes)
+    requested_categories = _scope_set(categories)
+
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for applicable in applicable_cards:
+        rule_id = str(applicable.get("id") or "").strip()
+        if not rule_id or rule_id in seen:
+            continue
+        checker_rule = checker_rules.get(rule_id, {})
+        if (
+            requested_scopes
+            and str(checker_rule.get("scope") or "").casefold()
+            not in requested_scopes
+        ):
+            continue
+        if (
+            requested_categories
+            and str(checker_rule.get("category") or "").casefold()
+            not in requested_categories
+        ):
+            continue
+        card = dict(ranked_by_id.get(rule_id, {}))
+        card.update(dict(applicable))
+        card["checkers"] = sorted(
+            set((ranked_by_id.get(rule_id, {}).get("checkers") or ()))
+            | set(applicable.get("checkers") or ())
+        )
+        card["direct_applicable"] = True
+        card["applicable"] = True
+        if "rule" not in card and checker_rule:
+            card["rule"] = checker_rule
+        if rule_id in ranked_by_id:
+            card["score"] = ranked_by_id[rule_id].get("score", 0.0)
+            card["reasons"] = ranked_by_id[rule_id].get("reasons", [])
+        else:
+            card["reasons"] = ["文件路径或 Checker 条件直接适用"]
+        merged.append(card)
+        seen.add(rule_id)
+
+    for ranked in ranked_cards:
+        rule_id = str(ranked.get("id") or "").strip()
+        if not rule_id or rule_id in seen:
+            continue
+        if len(merged) >= limit:
+            break
+        ranked["direct_applicable"] = False
+        ranked["applicable"] = False
+        merged.append(ranked)
+        seen.add(rule_id)
+    return merged
+
+
 __all__ = [
+    "PolicyIndexMetadataError",
     "PolicySearchIndex",
     "SQLitePolicyIndex",
     "SearchResult",
     "build_sqlite_index",
+    "retrieve_runtime_rules",
     "token_frequencies",
     "tokenize",
 ]

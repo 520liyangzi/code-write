@@ -7,6 +7,10 @@ description: 导入、更新或维护 Java 公司/部门/项目编码规范时�
 
 这是规则维护流程，不是业务编码流程。所有自动提取内容都只是候选；绝不替用户勾选接受，绝不把未批准规则写入全局 MD 或正式规则库。
 
+所有 `policy.ps1 prepare/review/activate` 命令只能在 Java Policy Kit 源码仓库根目录执行。执行前必须确认当前目录同时包含 `scripts/policy.ps1`、`policykit.json` 和 `policy-sources/`；若当前是业务仓库或只有已导出的固定运行时，停止并请用户切换到源码仓库，不得在错误目录猜测路径或维护规则。
+
+用户希望可视化操作时，可以在源码仓库运行 `scripts/policy.ps1 ui` 打开 Policy Studio。页面只是同一套 `REVIEW_ME.md`、审批哈希、激活和 SQLite 索引流程的操作界面，不得绕过下面的人工准入要求。
+
 ## 流程
 
 1. 确认输入目录只含本次真实 Markdown 规范，按 company、department、project 分目录；测试示例不得混入。
@@ -15,7 +19,7 @@ description: 导入、更新或维护 Java 公司/部门/项目编码规范时�
 4. 复杂控制流、空值来源、跨方法数据流、业务语义和无法精确表达的规则不生成伪正则；保留为 AI review，并在审阅备注中说明原因。
 5. 运行 `policy.ps1 review`，让每条可执行草案以 JSON 显示在 `REVIEW_ME.md`。运行测试或用最小正反样例验证每个草案；无测试证据的 checker 不得标为确定性。
 6. 向用户交付 `REVIEW_ME.md`，列出候选数量、带 checker 草案数量、仅 AI review 数量、疑似重复/冲突和测试结果。等待用户亲自勾选。
-7. 只有用户完成勾选后才能运行 `activate`；激活后再安装或 `install.ps1 -Update`。
+7. 只有用户完成勾选后才能运行 `activate`；激活后默认运行 `export-manual.ps1` 导出新的手工部署 release，只有明确采用自动安装方式时才运行 `install.ps1` 或 `install.ps1 -Update`。
 
 不得直接改 `approved-rules.json`。修改草案时编辑 `candidates.json` 中对应规则的 `metadata.checks`，随后重新运行 `review`。若自然语言正文也需修改，让用户使用 `REVIEW_ME.md` 的“修改后接受”。
 

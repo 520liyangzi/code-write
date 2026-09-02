@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 
 from policykit.hooks import _ai_review_evidence, handle_hook, main_hook, prepare_receipt
+from policykit.model import PolicyRule
+from policykit.review import bundle_fingerprint
+from policykit.search import build_sqlite_index
 
 
 class HookTests(unittest.TestCase):
@@ -39,9 +42,12 @@ class HookTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.index = self.home / "search-index.db"
+        self._rebuild_index()
         self.config = {
             "paths": {
                 "approved_rules": str(self.rules),
+                "search_index": str(self.index),
                 "receipts_dir": str(self.home / "receipts"),
                 "audit_dir": str(self.home / "audit"),
             },
@@ -62,6 +68,23 @@ class HookTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _rebuild_index(self) -> None:
+        payload = json.loads(self.rules.read_text(encoding="utf-8"))
+        rules = [PolicyRule.from_dict(item) for item in payload["rules"]]
+        version = str(payload["policy_version"])
+        bundle_id = bundle_fingerprint(rules, version)
+        payload["bundle_id"] = bundle_id
+        self.rules.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        build_sqlite_index(
+            rules,
+            self.index,
+            approved_only=True,
+            policy_version=version,
+            bundle_id=bundle_id,
+        )
+
     def test_first_write_blocks_then_retry_is_authorized(self) -> None:
         first = handle_hook("pre-edit", self.payload, self.config, self.home)
         first_output = first["hookSpecificOutput"]
@@ -70,6 +93,72 @@ class HookTests(unittest.TestCase):
 
         second = handle_hook("pre-edit", self.payload, self.config, self.home)
         self.assertIn("additionalContext", second["hookSpecificOutput"])
+
+    def test_missing_search_index_is_fail_closed(self) -> None:
+        self.index.unlink()
+        prepared = prepare_receipt(
+            self.target,
+            "missing-index-session",
+            query="线程",
+            config=self.config,
+            home=self.home,
+            cwd=self.home,
+        )
+        self.assertTrue(prepared["blocking"])
+        self.assertFalse(prepared["receipt_issued"])
+        self.assertIn("正式检索索引", prepared["error"])
+
+    def test_mismatched_bundle_id_is_fail_closed(self) -> None:
+        payload = json.loads(self.rules.read_text(encoding="utf-8"))
+        payload["bundle_id"] = "f" * 64
+        self.rules.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        prepared = prepare_receipt(
+            self.target,
+            "mismatch-index-session",
+            query="线程",
+            config=self.config,
+            home=self.home,
+            cwd=self.home,
+        )
+        self.assertTrue(prepared["blocking"])
+        self.assertFalse(prepared["receipt_issued"])
+        self.assertIn("bundle_id", prepared["error"])
+
+    def test_modified_rule_content_with_stale_bundle_id_is_fail_closed(self) -> None:
+        payload = json.loads(self.rules.read_text(encoding="utf-8"))
+        payload["rules"][0]["statement"] = "规则包被部分改写"
+        self.rules.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        prepared = prepare_receipt(
+            self.target,
+            "tampered-bundle-session",
+            query="线程",
+            config=self.config,
+            home=self.home,
+            cwd=self.home,
+        )
+        self.assertTrue(prepared["blocking"])
+        self.assertFalse(prepared["receipt_issued"])
+        self.assertIn("内容与 bundle_id 不一致", prepared["error"])
+
+    def test_missing_bundle_id_is_fail_closed(self) -> None:
+        payload = json.loads(self.rules.read_text(encoding="utf-8"))
+        payload.pop("bundle_id")
+        self.rules.write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        prepared = prepare_receipt(
+            self.target,
+            "missing-bundle-session",
+            config=self.config,
+            home=self.home,
+            cwd=self.home,
+        )
+        self.assertTrue(prepared["blocking"])
+        self.assertIn("64 位 bundle_id", prepared["error"])
 
     def test_skill_can_prepare_receipt_and_checker_blocks_bad_code(self) -> None:
         prepared = prepare_receipt(
@@ -158,6 +247,7 @@ class HookTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self._rebuild_index()
         prepared = prepare_receipt(
             self.target,
             "test-session",
@@ -214,6 +304,7 @@ class HookTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self._rebuild_index()
         prepared = prepare_receipt(
             self.target,
             "test-session",

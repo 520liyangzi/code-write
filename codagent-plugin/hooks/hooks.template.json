@@ -1,5 +1,5 @@
 {
-  "description": "Java Policy Kit hooks. install.ps1 replaces command placeholders with absolute paths.",
+  "description": "Java Policy Kit hooks. The installer or manual exporter replaces command placeholders with absolute paths.",
   "hooks": {
     "PreToolUse": [
       {

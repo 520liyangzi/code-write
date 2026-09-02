@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .io_utils import write_json, write_text
 from .model import PolicyRule, ReviewDecision, SCHEMA_VERSION
 
 
@@ -97,7 +98,43 @@ def review_fingerprint(rule: PolicyRule) -> str:
     return sha256(encoded).hexdigest()
 
 
-def render_review(rules: Iterable[PolicyRule]) -> str:
+def _review_decision_map(
+    decisions: Iterable[ReviewDecision] | Mapping[str, ReviewDecision] | None,
+) -> dict[str, ReviewDecision]:
+    if decisions is None:
+        return {}
+    if isinstance(decisions, Mapping):
+        values = dict(decisions)
+    else:
+        values: dict[str, ReviewDecision] = {}
+        for decision in decisions:
+            if decision.rule_id in values:
+                raise ReviewFormatError(f"规则决定重复: {decision.rule_id}")
+            values[decision.rule_id] = decision
+    for rule_id, decision in values.items():
+        if not isinstance(decision, ReviewDecision):
+            raise TypeError(f"规则 {rule_id} 的审阅决定类型无效")
+        if rule_id != decision.rule_id:
+            raise ReviewFormatError(
+                f"审阅决定键 {rule_id} 与规则 ID {decision.rule_id} 不一致"
+            )
+    return values
+
+
+def _safe_review_text(value: str, *, field: str, rule_id: str) -> str:
+    if re.search(
+        r"<!--\s*(?:/?POLICYKIT-|decision\s*:)", value, re.IGNORECASE
+    ):
+        raise ReviewFormatError(
+            f"规则 {rule_id} 的{field}包含 Policy Kit 保留标记"
+        )
+    return value
+
+
+def render_review(
+    rules: Iterable[PolicyRule],
+    decisions: Iterable[ReviewDecision] | Mapping[str, ReviewDecision] | None = None,
+) -> str:
     """Render a stable, checkbox-based ``REVIEW_ME.md`` document."""
 
     sorted_rules = sorted(
@@ -108,6 +145,13 @@ def render_review(rules: Iterable[PolicyRule]) -> str:
             rule.id,
         ),
     )
+    decision_map = _review_decision_map(decisions)
+    known_ids = {rule.id for rule in sorted_rules}
+    unknown_ids = set(decision_map) - known_ids
+    if unknown_ids:
+        raise ReviewFormatError(
+            "审阅决定包含未知规则 ID: " + ", ".join(sorted(unknown_ids))
+        )
     lines = [
         "# Java 规范候选规则审阅",
         "",
@@ -121,6 +165,32 @@ def render_review(rules: Iterable[PolicyRule]) -> str:
     ]
 
     for rule in sorted_rules:
+        fingerprint = review_fingerprint(rule)
+        decision = decision_map.get(rule.id)
+        decision_name = decision.decision if decision else ""
+        if decision_name == "needs_edit":
+            decision_name = "pending_review"
+        if decision and decision.review_hash and decision.review_hash != fingerprint:
+            raise ReviewFormatError(
+                f"规则 {rule.id} 的审阅决定已过期；请重新加载候选规则"
+            )
+        edited_statement = decision.edited_statement if decision else ""
+        notes = decision.notes if decision else ""
+        if decision_name == "modified" and not edited_statement.strip():
+            raise ReviewFormatError(
+                f"规则 {rule.id} 选择了“修改后接受”，但没有填写修改后的规则正文"
+            )
+        edited_statement = _safe_review_text(
+            edited_statement, field="修改正文", rule_id=rule.id
+        )
+        notes = _safe_review_text(notes, field="审阅备注", rule_id=rule.id)
+        edited_block = (
+            edited_statement
+            if edited_statement
+            else "<!-- 在这里填写修改后的完整规则正文 -->"
+        )
+        notes_block = notes if notes else "<!-- 可在这里填写原因、适用条件或后续事项 -->"
+
         location = rule.source.document
         if rule.source.section:
             location += f" / {rule.source.section}"
@@ -132,7 +202,7 @@ def render_review(rules: Iterable[PolicyRule]) -> str:
 
         lines.extend(
             [
-                f'<!-- POLICYKIT-RULE id="{rule.id}" review_hash="{review_fingerprint(rule)}" -->',
+                f'<!-- POLICYKIT-RULE id="{rule.id}" review_hash="{fingerprint}" -->',
                 f"## {rule.id} — {rule.title}",
                 "",
                 f"- 来源：`{location}`",
@@ -156,23 +226,23 @@ def render_review(rules: Iterable[PolicyRule]) -> str:
                 "",
                 "### 审阅决定（只能勾选一个）",
                 "",
-                "- [ ] 接受并启用 <!-- decision:approved -->",
-                "- [ ] 修改后接受 <!-- decision:modified -->",
-                "- [ ] 拒绝 <!-- decision:rejected -->",
-                "- [ ] 暂不处理 <!-- decision:pending_review -->",
+                f"- [{'x' if decision_name == 'approved' else ' '}] 接受并启用 <!-- decision:approved -->",
+                f"- [{'x' if decision_name == 'modified' else ' '}] 修改后接受 <!-- decision:modified -->",
+                f"- [{'x' if decision_name == 'rejected' else ' '}] 拒绝 <!-- decision:rejected -->",
+                f"- [{'x' if decision_name == 'pending_review' else ' '}] 暂不处理 <!-- decision:pending_review -->",
                 "",
                 "### 修改后的规则正文",
                 "",
                 "仅在勾选“修改后接受”时填写；请保留下面两个标记。",
                 "",
                 "<!-- POLICYKIT-EDITED:start -->",
-                "<!-- 在这里填写修改后的完整规则正文 -->",
+                edited_block,
                 "<!-- POLICYKIT-EDITED:end -->",
                 "",
                 "### 审阅备注（可选）",
                 "",
                 "<!-- POLICYKIT-NOTES:start -->",
-                "<!-- 可在这里填写原因、适用条件或后续事项 -->",
+                notes_block,
                 "<!-- POLICYKIT-NOTES:end -->",
                 "",
                 "<!-- /POLICYKIT-RULE -->",
@@ -185,14 +255,13 @@ def render_review(rules: Iterable[PolicyRule]) -> str:
 
 
 def write_review(
-    rules: Iterable[PolicyRule], output_path: str | Path = "REVIEW_ME.md"
+    rules: Iterable[PolicyRule],
+    output_path: str | Path = "REVIEW_ME.md",
+    decisions: Iterable[ReviewDecision] | Mapping[str, ReviewDecision] | None = None,
 ) -> Path:
-    """Write the review document and return its resolved path."""
+    """Atomically write the review document and return its resolved path."""
 
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_review(rules), encoding="utf-8")
-    return path.resolve()
+    return write_text(output_path, render_review(rules, decisions)).resolve()
 
 
 def parse_review_decisions(
@@ -368,6 +437,7 @@ def rules_payload(
     approved_only: bool = False,
     generated_at: str | None = None,
     policy_version: str | None = None,
+    bundle_id: str | None = None,
 ) -> dict[str, Any]:
     selected = [rule for rule in rules if not approved_only or rule.active]
     payload: dict[str, Any] = {
@@ -378,7 +448,31 @@ def rules_payload(
     }
     if policy_version:
         payload["policy_version"] = policy_version
+    if bundle_id:
+        payload["bundle_id"] = bundle_id
     return payload
+
+
+def bundle_fingerprint(
+    rules: Iterable[PolicyRule],
+    policy_version: str,
+) -> str:
+    """Return a stable identity for one activated rule set and version."""
+
+    canonical_rules = sorted(
+        (rule.to_dict() for rule in rules if rule.status == "approved"),
+        key=lambda value: str(value.get("id") or ""),
+    )
+    canonical = json.dumps(
+        {
+            "policy_version": str(policy_version or ""),
+            "rules": canonical_rules,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def write_rules_json(
@@ -388,20 +482,16 @@ def write_rules_json(
     approved_only: bool = False,
     generated_at: str | None = None,
     policy_version: str | None = None,
+    bundle_id: str | None = None,
 ) -> Path:
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = rules_payload(
         rules,
         approved_only=approved_only,
         generated_at=generated_at,
         policy_version=policy_version,
+        bundle_id=bundle_id,
     )
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    return path.resolve()
+    return write_json(output_path, payload).resolve()
 
 
 def export_approved_rules(
@@ -410,6 +500,7 @@ def export_approved_rules(
     *,
     generated_at: str | None = None,
     policy_version: str | None = None,
+    bundle_id: str | None = None,
 ) -> Path:
     """Export only explicitly approved rules as the authoritative JSON."""
 
@@ -419,6 +510,7 @@ def export_approved_rules(
         approved_only=True,
         generated_at=generated_at,
         policy_version=policy_version,
+        bundle_id=bundle_id,
     )
 
 
@@ -434,6 +526,7 @@ __all__ = [
     "REVIEW_FORMAT_VERSION",
     "ReviewFormatError",
     "apply_review_decisions",
+    "bundle_fingerprint",
     "export_approved_rules",
     "load_rules_json",
     "parse_review_decisions",

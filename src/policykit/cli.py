@@ -9,7 +9,7 @@ from typing import Any
 
 from . import __version__
 from .audit import AuditTrail
-from .checkers import validate_checker_rules
+from .checkers import PolicyChecker, validate_checker_rules
 from .compiler import write_global_block
 from .config import (
     CONFIG_NAME,
@@ -23,15 +23,17 @@ from .diagnostics import render_doctor, run_doctor
 from .extractor import extract_file
 from .hooks import main_hook, prepare_receipt
 from .io_utils import utc_now
+from .model import PolicyRule
 from .review import (
     apply_review_decisions,
+    bundle_fingerprint,
     export_approved_rules,
     load_rules_json,
     read_review_decisions,
     write_review,
     write_rules_json,
 )
-from .search import PolicySearchIndex, build_sqlite_index
+from .search import build_sqlite_index, retrieve_runtime_rules
 
 
 def _print(value: str = "") -> None:
@@ -180,6 +182,11 @@ def command_activate(args: argparse.Namespace) -> int:
     decisions = read_review_decisions(review_path, strict=True)
     reviewed = apply_review_decisions(candidates, decisions, strict=True)
     approved = [rule for rule in reviewed if rule.status == "approved"]
+    if not approved:
+        raise ValueError(
+            "没有任何已批准规则；为防止误清空现有策略，activate 已拒绝。"
+            "请先在 REVIEW_ME.md 中批准至少一条规则。"
+        )
     checker_errors = validate_checker_rules(approved)
     if checker_errors:
         raise ValueError(
@@ -191,20 +198,29 @@ def command_activate(args: argparse.Namespace) -> int:
     index_path = resolve_path(home, config, "search_index")
     global_path = resolve_path(home, config, "global_block")
     policy_version = args.policy_version or utc_now()
+    limit = int(config.get("review", {}).get("global_core_limit", 40))
+    bundle_id = bundle_fingerprint(approved, policy_version)
 
     write_rules_json(
         reviewed,
         reviewed_path,
         approved_only=False,
         policy_version=policy_version,
+        bundle_id=bundle_id,
     )
     export_approved_rules(
         reviewed,
         approved_path,
         policy_version=policy_version,
+        bundle_id=bundle_id,
     )
-    build_sqlite_index(approved, index_path, approved_only=True)
-    limit = int(config.get("review", {}).get("global_core_limit", 40))
+    build_sqlite_index(
+        approved,
+        index_path,
+        approved_only=True,
+        policy_version=policy_version,
+        bundle_id=bundle_id,
+    )
     write_global_block(approved, global_path, limit=limit)
 
     _print(f"候选规则：{len(candidates)}")
@@ -225,14 +241,63 @@ def _read_optional_code(args: argparse.Namespace) -> str:
 def command_search(args: argparse.Namespace) -> int:
     home, config = _load_context(args)
     approved_path = resolve_path(home, config, "approved_rules")
-    index = PolicySearchIndex.from_json(approved_path)
-    results = index.search(
+    index_path = resolve_path(home, config, "search_index")
+    approved_payload = json.loads(approved_path.read_text(encoding="utf-8-sig"))
+    if isinstance(approved_payload, list):
+        approved_rules = approved_payload
+        policy_version = "1"
+        bundle_id = ""
+    elif isinstance(approved_payload, dict):
+        approved_rules = approved_payload.get("rules", [])
+        policy_version = str(
+            approved_payload.get("policy_version")
+            or approved_payload.get("schema_version")
+            or "1"
+        )
+        bundle_id = str(approved_payload.get("bundle_id") or "")
+    else:
+        raise ValueError("已批准规则文件必须是 JSON 对象或数组")
+    if not isinstance(approved_rules, list):
+        raise ValueError("已批准规则的 rules 字段必须是数组")
+    if any(not isinstance(rule, dict) for rule in approved_rules):
+        raise ValueError("已批准规则的 rules 数组包含非对象条目")
+    normalized_bundle_id = bundle_id.casefold()
+    parsed_rules = [PolicyRule.from_dict(rule) for rule in approved_rules]
+    if not parsed_rules:
+        raise ValueError("approved-rules.json 不包含已批准规则；请重新激活")
+    if any(not rule.active for rule in parsed_rules):
+        raise ValueError("approved-rules.json 包含未批准规则；请重新激活")
+    calculated_bundle_id = bundle_fingerprint(parsed_rules, policy_version)
+    if (
+        len(normalized_bundle_id) != 64
+        or any(character not in "0123456789abcdef" for character in normalized_bundle_id)
+        or normalized_bundle_id != calculated_bundle_id
+    ):
+        raise ValueError(
+            "approved-rules.json 的 bundle_id 缺失或与规则内容不一致；请重新激活"
+        )
+    configured_block_severities = config.get("runtime", {}).get(
+        "block_severities", ("blocker", "major")
+    )
+    if isinstance(configured_block_severities, str):
+        configured_block_severities = (configured_block_severities,)
+    checker = PolicyChecker(
+        approved_rules,
+        fail_closed=bool(config.get("runtime", {}).get("fail_closed", True)),
+        block_severities=configured_block_severities,
+    )
+    code = _read_optional_code(args)
+    results = retrieve_runtime_rules(
+        index_path,
+        checker,
         query=args.query or "",
         file_path=args.file or "",
-        code=_read_optional_code(args),
+        code=code,
         limit=args.limit,
         scopes=args.scope,
         categories=args.category,
+        expected_policy_version=policy_version,
+        expected_bundle_id=normalized_bundle_id,
     )
     receipt_payload = None
     if args.receipt:
@@ -244,12 +309,12 @@ def command_search(args: argparse.Namespace) -> int:
             args.file,
             args.session,
             query=args.query or "",
-            code=_read_optional_code(args),
+            code=code,
             config=config,
             home=home,
             cwd=os.getcwd(),
         )
-    ranked_results = [result.to_dict() for result in results]
+    ranked_results = results
     if receipt_payload is not None:
         compact_receipt = {
             key: receipt_payload.get(key)
@@ -312,10 +377,17 @@ def command_search(args: argparse.Namespace) -> int:
         return 0
     _print(f"[规范查询] 命中 {len(results)} 条已审核规则：")
     for result in results:
-        rule = result.rule
-        reason = "；".join(result.reasons)
-        _print(f"- [{rule.id}] [{rule.severity}] {rule.statement}")
-        _print(f"  来源：{rule.source.document} / {rule.source.section or '未标章节'}")
+        rule = result.get("rule") if isinstance(result.get("rule"), dict) else result
+        reason = "；".join(str(value) for value in result.get("reasons", ()))
+        source = rule.get("source") if isinstance(rule.get("source"), dict) else {}
+        _print(
+            f"- [{rule.get('id', 'UNKNOWN-RULE')}] "
+            f"[{rule.get('severity', 'major')}] {rule.get('statement', '')}"
+        )
+        _print(
+            f"  来源：{source.get('document', '')} / "
+            f"{source.get('section') or '未标章节'}"
+        )
         _print(f"  命中依据：{reason}")
     return 0
 
@@ -354,6 +426,20 @@ def command_doctor(args: argparse.Namespace) -> int:
     else:
         _print(render_doctor(results))
     return 1 if any(result["status"] == "fail" for result in results) else 0
+
+
+def command_ui(args: argparse.Namespace) -> int:
+    home, config = _load_context(args)
+    from .studio import run_server
+
+    run_server(
+        home,
+        config,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_open,
+    )
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -420,6 +506,12 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="检查本地安装")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(handler=command_doctor)
+
+    ui = subparsers.add_parser("ui", help="启动本机 Policy Studio")
+    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--port", type=int, default=8765)
+    ui.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    ui.set_defaults(handler=command_ui)
     return parser
 
 

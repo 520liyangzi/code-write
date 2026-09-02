@@ -9,6 +9,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from policykit.cli import main
+from policykit.model import PolicyRule
+from policykit.review import bundle_fingerprint
+from policykit.search import build_sqlite_index
 
 
 class CliEndToEndTests(unittest.TestCase):
@@ -17,6 +20,31 @@ class CliEndToEndTests(unittest.TestCase):
         with redirect_stdout(stdout), redirect_stderr(stderr):
             result = main(list(args))
         return result, stdout.getvalue(), stderr.getvalue()
+
+    def install_runtime_bundle(
+        self, home: Path, *, policy_version: str, values: list[dict[str, object]]
+    ) -> None:
+        rules = [PolicyRule.from_dict(value) for value in values]
+        bundle_id = bundle_fingerprint(rules, policy_version)
+        (home / ".policy-work" / "approved-rules.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "policy_version": policy_version,
+                    "bundle_id": bundle_id,
+                    "rules": values,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        build_sqlite_index(
+            rules,
+            home / ".policy-work" / "search-index.db",
+            approved_only=True,
+            policy_version=policy_version,
+            bundle_id=bundle_id,
+        )
 
     def test_prepare_review_activate_search(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -80,6 +108,40 @@ class CliEndToEndTests(unittest.TestCase):
             self.assertEqual(2, status)
             self.assertIn("正则无效", error)
 
+    def test_activate_without_approved_rules_preserves_existing_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.run_cli("--home", str(home), "init")
+            source = home / "policy-sources" / "company" / "Java编码规范.md"
+            source.write_text(
+                "# 集合规范\n\n- 禁止向 `Map.of` 传入可能为空的值。\n",
+                encoding="utf-8",
+            )
+            self.run_cli("--home", str(home), "prepare")
+            review = home / ".policy-work" / "REVIEW_ME.md"
+            review.write_text(
+                review.read_text(encoding="utf-8").replace(
+                    "- [ ] 接受并启用 <!-- decision:approved -->",
+                    "- [x] 接受并启用 <!-- decision:approved -->",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            status, _, error = self.run_cli(
+                "--home", str(home), "activate", "--policy-version", "stable-v1"
+            )
+            self.assertEqual(0, status, error)
+            approved_path = home / ".policy-work" / "approved-rules.json"
+            before = approved_path.read_bytes()
+
+            self.run_cli("--home", str(home), "review")
+            status, _, error = self.run_cli(
+                "--home", str(home), "activate", "--policy-version", "empty-v2"
+            )
+            self.assertEqual(2, status)
+            self.assertIn("误清空", error)
+            self.assertEqual(before, approved_path.read_bytes())
+
     def test_hook_cli_accepts_pre_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -119,34 +181,27 @@ class CliEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             self.run_cli("--home", str(home), "init")
-            rules = home / ".policy-work" / "approved-rules.json"
-            rules.write_text(
-                json.dumps(
+            self.install_runtime_bundle(
+                home,
+                policy_version="path-test",
+                values=[
                     {
-                        "schema_version": 1,
-                        "policy_version": "path-test",
-                        "rules": [
-                            {
-                                "id": "PATH-ONLY",
-                                "title": "文件位置约定",
-                                "statement": "控制层文件遵循专用约定",
-                                "status": "approved",
-                                "severity": "major",
-                                "source": {"document": "project.md"},
-                                "metadata": {
-                                    "checks": [
-                                        {
-                                            "type": "ai_review",
-                                            "include_paths": ["**/special/**"],
-                                        }
-                                    ]
-                                },
-                            }
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+                        "id": "PATH-ONLY",
+                        "title": "文件位置约定",
+                        "statement": "控制层文件遵循专用约定",
+                        "status": "approved",
+                        "severity": "major",
+                        "source": {"document": "project.md"},
+                        "metadata": {
+                            "checks": [
+                                {
+                                    "type": "ai_review",
+                                    "include_paths": ["**/special/**"],
+                                }
+                            ]
+                        },
+                    }
+                ],
             )
             status, output, error = self.run_cli(
                 "--home",
@@ -173,7 +228,6 @@ class CliEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             self.run_cli("--home", str(home), "init")
-            rules = home / ".policy-work" / "approved-rules.json"
             rule_values = []
             for index in range(20):
                 rule_values.append(
@@ -194,16 +248,10 @@ class CliEndToEndTests(unittest.TestCase):
                         },
                     }
                 )
-            rules.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "policy_version": "long-test",
-                        "rules": rule_values,
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+            self.install_runtime_bundle(
+                home,
+                policy_version="long-test",
+                values=rule_values,
             )
             status, output, error = self.run_cli(
                 "--home",

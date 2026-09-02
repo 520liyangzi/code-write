@@ -10,3 +10,4 @@ build/
 dist/
 .policy-work/
 policy-sources/
+manual-package/

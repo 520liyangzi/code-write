@@ -28,6 +28,12 @@ from uuid import uuid4
 
 from .audit import AuditTrail, safe_session_id
 from .checkers import CheckResult, PolicyChecker
+from .model import PolicyRule
+from .review import bundle_fingerprint
+from .search import (
+    SQLitePolicyIndex,
+    retrieve_runtime_rules,
+)
 
 
 HOOK_SCHEMA_VERSION = 1
@@ -181,96 +187,88 @@ def _path_from_config(
     return path.resolve() if path.is_absolute() else (home / path).resolve()
 
 
-def _load_rule_bundle(path: Path) -> tuple[list[dict[str, Any]], str, str | None]:
-    """Return ``(rules, policy_version, error)`` without raising to hooks."""
+def _load_rule_bundle(
+    path: Path,
+) -> tuple[list[dict[str, Any]], str, str, str | None]:
+    """Return ``(rules, policy_version, bundle_id, error)`` for hooks."""
 
     if not path.is_file():
-        return [], "unavailable", f"已审核规则文件不存在：{path}"
+        return [], "unavailable", "", f"已审核规则文件不存在：{path}"
     try:
         with path.open("r", encoding="utf-8-sig") as handle:
             payload = json.load(handle)
     except (OSError, ValueError) as exc:
-        return [], "unavailable", f"无法读取已审核规则：{exc}"
+        return [], "unavailable", "", f"无法读取已审核规则：{exc}"
     if isinstance(payload, list):
         raw_rules = payload
         version = "1"
+        bundle_id = ""
     elif isinstance(payload, Mapping):
         raw_rules = payload.get("rules", [])
         version = _text(
             payload.get("policy_version") or payload.get("schema_version") or "1"
         )
+        bundle_id = _text(payload.get("bundle_id"))
     else:
-        return [], "unavailable", "已审核规则文件必须是 JSON 对象或数组"
+        return [], "unavailable", "", "已审核规则文件必须是 JSON 对象或数组"
     if not isinstance(raw_rules, list):
-        return [], version, "已审核规则的 rules 字段必须是数组"
-    return [dict(item) for item in raw_rules if isinstance(item, Mapping)], version, None
+        return [], version, bundle_id, "已审核规则的 rules 字段必须是数组"
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_id):
+        return (
+            [],
+            version,
+            bundle_id,
+            "已审核规则缺少有效的 64 位 bundle_id；请重新激活规则包",
+        )
+    if not all(isinstance(item, Mapping) for item in raw_rules):
+        return [], version, bundle_id, "已审核规则的 rules 元素必须是 JSON 对象"
+    try:
+        parsed_rules = [PolicyRule.from_dict(item) for item in raw_rules]
+    except (TypeError, ValueError) as exc:
+        return [], version, bundle_id, f"已审核规则内容无效：{exc}"
+    if not parsed_rules:
+        return [], version, bundle_id, "正式规则包不包含已批准规则；请重新激活"
+    if any(not rule.active for rule in parsed_rules):
+        return [], version, bundle_id, "正式规则包包含未批准规则；请重新激活"
+    bundle_id = bundle_id.casefold()
+    if bundle_fingerprint(parsed_rules, version) != bundle_id:
+        return (
+            [],
+            version,
+            bundle_id,
+            "已审核规则内容与 bundle_id 不一致；规则包可能不完整或被修改",
+        )
+    return (
+        [dict(item) for item in raw_rules],
+        version,
+        bundle_id,
+        None,
+    )
 
 
 def _search_cards(
-    rules_path: Path,
+    search_index: Path,
     checker: PolicyChecker,
     *,
     query: str,
     file_path: str,
     code: str,
     limit: int,
+    expected_policy_version: str,
+    expected_bundle_id: str,
 ) -> list[dict[str, Any]]:
-    """Union ranked text matches with explicitly applicable checker rules."""
+    """Retrieve only from the activated index and merge checker applicability."""
 
-    cards: list[dict[str, Any]] = []
-    try:
-        from .search import PolicySearchIndex
-
-        matches = PolicySearchIndex.from_json(rules_path).search(
-            query=query,
-            file_path=file_path,
-            code=code,
-            limit=limit,
-        )
-        cards.extend(
-            {
-                "id": result.rule.id,
-                "title": result.rule.title,
-                "statement": result.rule.statement,
-                "severity": result.rule.severity,
-                "category": result.rule.category,
-                "source": " / ".join(
-                    part
-                    for part in (
-                        result.rule.source.document,
-                        result.rule.source.section,
-                    )
-                    if part
-                ),
-                "checkers": [],
-                "score": result.score,
-                "reasons": list(result.reasons),
-            }
-            for result in matches
-        )
-    except (OSError, ValueError, TypeError, ImportError):
-        # The rule bundle remains authoritative; deterministic applicability
-        # below still works if optional ranked search is unavailable.
-        pass
-
-    cards.extend(
-        checker.applicable_rules(file_path, f"{query}\n{code}", max_rules=None)
+    return retrieve_runtime_rules(
+        search_index,
+        checker,
+        query=query,
+        file_path=file_path,
+        code=code,
+        limit=limit,
+        expected_policy_version=expected_policy_version,
+        expected_bundle_id=expected_bundle_id or None,
     )
-    merged: list[dict[str, Any]] = []
-    positions: dict[str, int] = {}
-    for card in cards:
-        rule_id = _text(card.get("id"))
-        if not rule_id:
-            continue
-        if rule_id not in positions:
-            positions[rule_id] = len(merged)
-            merged.append(dict(card))
-            continue
-        existing = merged[positions[rule_id]]
-        existing["checkers"] = sorted(
-            set(existing.get("checkers") or ()) | set(card.get("checkers") or ())
-        )
-    return merged[: max(0, limit)]
 
 
 def _event_name(value: Any) -> str:
@@ -669,6 +667,13 @@ class HookRuntime:
             ".policy-work/approved-rules.json",
             env="POLICYKIT_APPROVED_RULES",
         )
+        self.search_index_path = _path_from_config(
+            self.config,
+            self.home,
+            "search_index",
+            ".policy-work/search-index.db",
+            env="POLICYKIT_SEARCH_INDEX",
+        )
         self.receipts_dir = _path_from_config(
             self.config,
             self.home,
@@ -715,13 +720,39 @@ class HookRuntime:
 
     def _resources(
         self, payload: Mapping[str, Any]
-    ) -> tuple[str, Path, dict[str, Any], AuditTrail, list[dict[str, Any]], str, str | None]:
+    ) -> tuple[
+        str,
+        Path,
+        dict[str, Any],
+        AuditTrail,
+        list[dict[str, Any]],
+        str,
+        str,
+        str | None,
+    ]:
         session_id = _session_id(payload)
         state_path = self.receipts_dir / f"{session_id}.json"
         state = _read_state(state_path, session_id)
         audit = AuditTrail(self.audit_dir, session_id)
-        rules, version, error = _load_rule_bundle(self.rules_path)
-        return session_id, state_path, state, audit, rules, version, error
+        rules, version, bundle_id, error = _load_rule_bundle(self.rules_path)
+        if error is None:
+            try:
+                SQLitePolicyIndex(self.search_index_path).validate_metadata(
+                    expected_policy_version=version,
+                    expected_bundle_id=bundle_id or None,
+                )
+            except (OSError, ValueError) as exc:
+                error = f"正式检索索引不可用或与规则包不一致：{exc}"
+        return (
+            session_id,
+            state_path,
+            state,
+            audit,
+            rules,
+            version,
+            bundle_id,
+            error,
+        )
 
     def prepare_receipt(
         self,
@@ -781,6 +812,7 @@ class HookRuntime:
             audit,
             rules,
             policy_version,
+            bundle_id,
             policy_error,
         ) = self._resources(payload)
         checker = PolicyChecker(
@@ -788,14 +820,21 @@ class HookRuntime:
             fail_closed=self.fail_closed,
             block_severities=self.block_severities,
         )
-        cards = _search_cards(
-            self.rules_path,
-            checker,
-            query=query,
-            file_path=display,
-            code=code,
-            limit=self.max_rules,
-        )
+        cards: list[dict[str, Any]] = []
+        if policy_error is None:
+            try:
+                cards = _search_cards(
+                    self.search_index_path,
+                    checker,
+                    query=query,
+                    file_path=display,
+                    code=code,
+                    limit=self.max_rules,
+                    expected_policy_version=policy_version,
+                    expected_bundle_id=bundle_id,
+                )
+            except (OSError, ValueError) as exc:
+                policy_error = f"正式检索索引查询失败：{exc}"
         codegraph_status = _codegraph_status(payload)
         policy_status, context = _format_context(
             display,
@@ -813,6 +852,7 @@ class HookRuntime:
                 "issued_at_epoch": time.time(),
                 "path": display,
                 "policy_version": policy_version,
+                "bundle_id": bundle_id,
                 "policy_status": policy_status,
                 "matched_rule_ids": [card["id"] for card in cards],
                 "matched_rules": cards,
@@ -836,6 +876,7 @@ class HookRuntime:
             "matched_rule_ids": [card["id"] for card in cards],
             "matched_rules": cards,
             "policy_version": policy_version,
+            "bundle_id": bundle_id,
             "receipt_issued": issued,
             "blocking": bool(policy_error and self.fail_closed),
             "error": policy_error,
@@ -889,6 +930,7 @@ class HookRuntime:
             audit,
             rules,
             policy_version,
+            bundle_id,
             policy_error,
         ) = self._resources(payload)
         checker = PolicyChecker(
@@ -897,14 +939,21 @@ class HookRuntime:
             block_severities=self.block_severities,
         )
         proposed = _proposed_content(payload, target)
-        cards = _search_cards(
-            self.rules_path,
-            checker,
-            query=_text(payload.get("task") or payload.get("prompt")),
-            file_path=display,
-            code=proposed,
-            limit=self.max_rules,
-        )
+        cards: list[dict[str, Any]] = []
+        if policy_error is None:
+            try:
+                cards = _search_cards(
+                    self.search_index_path,
+                    checker,
+                    query=_text(payload.get("task") or payload.get("prompt")),
+                    file_path=display,
+                    code=proposed,
+                    limit=self.max_rules,
+                    expected_policy_version=policy_version,
+                    expected_bundle_id=bundle_id,
+                )
+            except (OSError, ValueError) as exc:
+                policy_error = f"正式检索索引查询失败：{exc}"
         codegraph_status = _codegraph_status(payload)
         policy_status, context = _format_context(
             display,
@@ -931,6 +980,7 @@ class HookRuntime:
         receipt = receipts.get(key)
         receipt_valid = _valid_receipt(receipt, self.receipt_ttl) and (
             _text(receipt.get("policy_version")) == policy_version
+            and _text(receipt.get("bundle_id")) == bundle_id
         )
         authorization_context = context
         if receipt_valid:
@@ -944,13 +994,15 @@ class HookRuntime:
             }
             combined: list[dict[str, Any]] = []
             seen_ids: set[str] = set()
-            for card in (*prepared_cards, *cards):
+            direct_cards = [card for card in cards if card.get("direct_applicable")]
+            ranked_cards = [card for card in cards if not card.get("direct_applicable")]
+            for card in (*direct_cards, *prepared_cards, *ranked_cards):
                 rule_id = _text(card.get("id"))
                 if not rule_id or rule_id in seen_ids:
                     continue
                 seen_ids.add(rule_id)
                 combined.append(card)
-            cards = combined[: self.max_rules]
+            cards = combined[: max(self.max_rules, len(direct_cards))]
             policy_status, context = _format_context(
                 display,
                 cards,
@@ -985,6 +1037,7 @@ class HookRuntime:
                 "issued_at_epoch": time.time(),
                 "path": display,
                 "policy_version": policy_version,
+                "bundle_id": bundle_id,
                 "policy_status": policy_status,
                 "matched_rule_ids": matched_rule_ids,
                 "matched_rules": cards,
@@ -1040,12 +1093,16 @@ class HookRuntime:
             audit,
             rules,
             policy_version,
+            bundle_id,
             policy_error,
         ) = self._resources(payload)
         key = _receipt_key(target)
         receipt = state["receipts"].pop(key, None)
         receipt_authorized = (
-            isinstance(receipt, Mapping) and receipt.get("status") == "authorized"
+            isinstance(receipt, Mapping)
+            and receipt.get("status") == "authorized"
+            and _text(receipt.get("policy_version")) == policy_version
+            and _text(receipt.get("bundle_id")) == bundle_id
         )
 
         if _tool_failed(payload):
@@ -1168,6 +1225,7 @@ class HookRuntime:
             audit,
             rules,
             policy_version,
+            _bundle_id,
             policy_error,
         ) = self._resources(payload)
         changed: dict[str, Any] = dict(state.get("changed_files", {}))

@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101b33">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'">
+  <title>Java Policy Kit</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand" href="#overview" aria-label="Java Policy Kit 首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" role="img">
+            <path d="M16 2.5 27 8.8v14.4L16 29.5 5 23.2V8.8L16 2.5Z"></path>
+            <path d="m10.2 16 3.6 3.6 8-8"></path>
+          </svg>
+        </span>
+        <span>
+          <strong>Java Policy Kit</strong>
+          <small>规范准入与执行台</small>
+        </span>
+      </a>
+
+      <nav class="nav-list">
+        <a class="nav-item is-active" href="#overview" data-nav="overview">
+          <span aria-hidden="true">01</span> 概览
+        </a>
+        <a class="nav-item" href="#review" data-nav="review">
+          <span aria-hidden="true">02</span> 导入与审阅
+        </a>
+        <a class="nav-item" href="#activate" data-nav="activate">
+          <span aria-hidden="true">03</span> 激活规则
+        </a>
+        <a class="nav-item" href="#search" data-nav="search">
+          <span aria-hidden="true">04</span> 检索沙盒
+        </a>
+        <a class="nav-item" href="#raw-review" data-nav="raw-review">
+          <span aria-hidden="true">05</span> 原始 REVIEW_ME
+        </a>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="connection-pill" id="connectionPill" data-state="checking">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connectionText">正在连接本地服务</span>
+        </div>
+        <p>完全离线 · 无外部 CDN</p>
+      </div>
+    </aside>
+
+    <main class="workspace" id="mainContent">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">POLICY CONTROL CENTER</p>
+          <h1>Java 规范工作台</h1>
+        </div>
+        <button class="button button-ghost" id="refreshButton" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"></path></svg>
+          刷新数据
+        </button>
+      </header>
+
+      <div class="gate-banner" role="note" aria-label="重要说明">
+        <span class="gate-icon" aria-hidden="true">!</span>
+        <div>
+          <strong>REVIEW_ME 是一次性规则准入闸门，不是运行时上下文。</strong>
+          <p>这里完成候选规则的人工作出决定；只有批准后的精简规则进入索引。Codagent 编码时按文件和场景检索，不会加载整份 REVIEW_ME 或原始规范。</p>
+        </div>
+      </div>
+
+      <div class="error-banner" id="pageError" role="alert" hidden>
+        <div>
+          <strong>操作未完成</strong>
+          <p id="pageErrorText"></p>
+        </div>
+        <button class="button button-ghost" id="dismissError" type="button">关闭</button>
+      </div>
+
+      <section class="section-block" id="overview" tabindex="-1" aria-labelledby="overviewTitle">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">WORKSPACE STATUS</p>
+            <h2 id="overviewTitle">规则库概览</h2>
+          </div>
+          <p class="section-description">先导入、再审阅，最后激活。任何候选规则都不会自动生效。</p>
+        </div>
+
+        <div class="stats-grid" aria-label="规则库状态统计">
+          <article class="stat-card stat-primary">
+            <span class="stat-label">候选规则</span>
+            <strong class="stat-value" id="statCandidates">—</strong>
+            <small id="statCandidatesHint">等待读取状态</small>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">已批准</span>
+            <strong class="stat-value" id="statApproved">—</strong>
+            <small>只有这些规则可进入运行时</small>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">待处理</span>
+            <strong class="stat-value" id="statPending">—</strong>
+            <small>尚未做出明确决定</small>
+          </article>
+          <article class="stat-card">
+            <span class="stat-label">当前策略版本</span>
+            <strong class="stat-value stat-version" id="statVersion">未激活</strong>
+            <small id="statIndexHint">索引状态未知</small>
+          </article>
+        </div>
+
+        <div class="workflow-strip" aria-label="处理流程">
+          <div class="workflow-step"><span>1</span><div><strong>规范文档</strong><small>公司 / 部门 / 项目 Markdown</small></div></div>
+          <i aria-hidden="true"></i>
+          <div class="workflow-step"><span>2</span><div><strong>候选审批</strong><small>REVIEW_ME 一次性准入</small></div></div>
+          <i aria-hidden="true"></i>
+          <div class="workflow-step"><span>3</span><div><strong>正式索引</strong><small>只包含已批准规则</small></div></div>
+          <i aria-hidden="true"></i>
+          <div class="workflow-step"><span>4</span><div><strong>AI 写前检索</strong><small>按文件和场景加载</small></div></div>
+        </div>
+      </section>
+
+      <section class="section-block" id="review" tabindex="-1" aria-labelledby="reviewTitle">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">IMPORT &amp; ADMISSION</p>
+            <h2 id="reviewTitle">导入规范并审阅候选</h2>
+          </div>
+          <button class="button button-primary" id="prepareButton" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"></path></svg>
+            生成候选规则
+          </button>
+        </div>
+
+        <div class="import-panel">
+          <div class="import-controls">
+            <label class="field field-compact">
+              <span>文档范围</span>
+              <select id="documentScope">
+                <option value="company">公司级</option>
+                <option value="department">部门级</option>
+                <option value="project">项目级</option>
+              </select>
+            </label>
+            <p>一次选择的文件使用同一范围；不同范围请分批导入。</p>
+          </div>
+
+          <div class="drop-zone" id="dropZone" tabindex="0" role="button" aria-describedby="dropHelp">
+              <input id="fileInput" type="file" accept=".md,.markdown,text/markdown" multiple hidden>
+            <span class="drop-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L8 8m4-4 4 4M5 14v5h14v-5"></path></svg>
+            </span>
+            <strong>拖放多个 Markdown 文件到这里</strong>
+            <p id="dropHelp">或按 Enter / 点击选择文件。文件只发送到当前本地服务。</p>
+            <button class="button button-secondary" id="chooseFilesButton" type="button">选择 .md 文件</button>
+          </div>
+
+          <div class="file-queue" id="fileQueue" aria-live="polite">
+            <div class="empty-inline" id="fileQueueEmpty">尚未选择文件</div>
+          </div>
+
+          <div class="import-actions">
+            <span id="fileSummary">0 个文件待导入</span>
+            <button class="button button-primary" id="importButton" type="button" disabled>导入选中文档</button>
+          </div>
+        </div>
+
+        <div class="review-toolbar" aria-label="候选规则筛选">
+          <label class="search-field wide-field">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16 16 5 5"></path></svg>
+            <span class="sr-only">搜索规则</span>
+            <input id="ruleSearch" type="search" placeholder="搜索规则 ID、标题、正文或来源…">
+          </label>
+          <label class="field toolbar-field">
+            <span class="sr-only">决定状态</span>
+            <select id="decisionFilter">
+              <option value="all">全部决定</option>
+              <option value="pending_review">待处理</option>
+              <option value="approved">已批准</option>
+              <option value="modified">修改后接受</option>
+              <option value="rejected">已拒绝</option>
+            </select>
+          </label>
+          <label class="field toolbar-field">
+            <span class="sr-only">严重度</span>
+            <select id="severityFilter">
+              <option value="all">全部严重度</option>
+              <option value="blocker">Blocker</option>
+              <option value="major">Major</option>
+              <option value="advisory">Advisory</option>
+            </select>
+          </label>
+          <label class="field toolbar-field">
+            <span class="sr-only">规则范围</span>
+            <select id="scopeFilter">
+              <option value="all">全部范围</option>
+              <option value="company">公司级</option>
+              <option value="department">部门级</option>
+              <option value="project">项目级</option>
+              <option value="unknown">未识别</option>
+            </select>
+          </label>
+          <label class="field toolbar-field category-filter">
+            <span class="sr-only">分类</span>
+            <input id="categoryFilter" type="search" placeholder="分类筛选">
+          </label>
+        </div>
+
+        <div class="list-meta">
+          <span id="ruleCountText">正在读取候选规则…</span>
+          <button class="text-button" id="clearFiltersButton" type="button">清除筛选</button>
+        </div>
+
+        <div class="rule-list" id="ruleList" aria-live="polite" aria-busy="true"></div>
+      </section>
+
+      <section class="section-block" id="activate" tabindex="-1" aria-labelledby="activateTitle">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">PUBLISH</p>
+            <h2 id="activateTitle">激活已批准规则</h2>
+          </div>
+          <span class="phase-chip">人工确认后的唯一发布入口</span>
+        </div>
+
+        <div class="activation-layout">
+          <div class="activation-copy">
+            <h3>把审阅决定编译为运行时规则库</h3>
+            <p>激活只接收已经保存的决定。未处理、拒绝或缺少修改正文的规则不会进入正式索引。</p>
+            <ul>
+              <li><span id="activationApproved">0</span> 条规则准备批准</li>
+              <li><span id="activationPending">0</span> 条规则仍待处理</li>
+              <li><span id="activationRejected">0</span> 条规则已拒绝</li>
+              <li>激活后 Codagent 只检索批准规则</li>
+            </ul>
+          </div>
+          <form class="activation-form" id="activationForm">
+            <label class="field">
+              <span>策略版本</span>
+              <input id="policyVersion" type="text" maxlength="80" autocomplete="off" placeholder="例如 2026.08-company-v1">
+              <small>建议使用可审计、不会重复的版本号。</small>
+            </label>
+            <button class="button button-danger" id="activateButton" type="submit">确认并激活规则库</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="section-block" id="search" tabindex="-1" aria-labelledby="searchTitle">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">RETRIEVAL LAB</p>
+            <h2 id="searchTitle">索引检索沙盒</h2>
+          </div>
+          <p class="section-description">调用与 Codagent Hook 相同的运行时召回入口，只查询已激活的正式索引；本页不会创建写入 receipt。</p>
+        </div>
+
+        <form class="search-lab" id="searchForm">
+          <div class="search-inputs">
+            <label class="field">
+              <span>任务意图 <b aria-hidden="true">*</b></span>
+              <textarea id="searchQuery" rows="3" required placeholder="例如：为 Spring MVC Controller 增加批量查询接口，并处理异常日志"></textarea>
+            </label>
+            <label class="field">
+              <span>目标文件路径</span>
+              <input id="searchFile" type="text" placeholder="src/main/java/com/acme/web/OrderController.java">
+            </label>
+            <label class="field">
+              <span>相关代码片段</span>
+              <textarea class="code-input" id="searchCode" rows="8" spellcheck="false" placeholder="粘贴准备修改或刚生成的 Java 代码…"></textarea>
+            </label>
+            <div class="filter-grid">
+              <label class="field">
+                <span>范围 filters</span>
+                <input id="searchScopes" type="text" placeholder="company, department">
+              </label>
+              <label class="field">
+                <span>分类 filters</span>
+                <input id="searchCategories" type="text" placeholder="security, performance">
+              </label>
+              <label class="field">
+                <span>最多返回</span>
+                <input id="searchLimit" type="number" min="1" max="50" value="12">
+              </label>
+            </div>
+            <button class="button button-primary search-submit" id="searchButton" type="submit">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m16 16 5 5"></path></svg>
+              查询已激活索引
+            </button>
+          </div>
+
+          <div class="search-results-panel">
+            <div class="results-head">
+              <div><strong>召回结果</strong><span id="searchResultCount">尚未查询</span></div>
+              <span class="index-badge" id="searchIndexBadge">索引状态未知</span>
+            </div>
+            <div class="search-results" id="searchResults" aria-live="polite">
+              <div class="empty-state compact-empty">
+                <span aria-hidden="true">⌕</span>
+                <strong>在左侧构造一次真实查询</strong>
+                <p>组合任务意图、目标路径和代码，比只输入关键词更接近 Codagent 的运行时检索。</p>
+              </div>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <section class="section-block" id="raw-review" tabindex="-1" aria-labelledby="rawReviewTitle">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">SOURCE OF ADMISSION</p>
+            <h2 id="rawReviewTitle">原始 REVIEW_ME</h2>
+          </div>
+          <div class="button-row">
+            <button class="button button-ghost" id="reloadRawButton" type="button">重新读取</button>
+            <button class="button button-secondary" id="copyRawButton" type="button">复制全文</button>
+          </div>
+        </div>
+        <p class="raw-note">这是供人工审阅和留档的原始准入文件。运行时不会把它整体发送给 Codagent。</p>
+        <pre class="raw-review" id="rawReviewText" tabindex="0" aria-label="REVIEW_ME 原始内容">正在读取…</pre>
+      </section>
+
+      <footer class="footer">
+        <span>Java Policy Kit · Local-first policy governance</span>
+        <span id="lastUpdated">尚未同步</span>
+      </footer>
+    </main>
+  </div>
+
+  <div class="loading-rail" id="loadingRail" aria-hidden="true"></div>
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

@@ -94,6 +94,16 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Java Policy Kit requires Python 3.10 or newer.'
 }
 
+# Bundle identity is a safety invariant, not an optional environment doctor
+# check. Validate it before creating a release or touching the plugin target.
+& (Join-Path $sourceRoot 'scripts\policy.ps1') `
+    -PythonCommand $PythonCommand `
+    -PolicyHome $sourceRoot `
+    doctor
+if ($LASTEXITCODE -ne 0) {
+    throw 'Activated rules and SQLite index are inconsistent. Re-run activate.'
+}
+
 $releaseId = Get-Date -Format 'yyyyMMdd-HHmmss'
 $releaseBase = Join-Path $InstallRoot 'releases'
 $releasePath = Join-Path $releaseBase $releaseId
