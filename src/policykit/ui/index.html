@@ -181,9 +181,10 @@
           <label class="field toolbar-field">
             <span class="sr-only">决定状态</span>
             <select id="decisionFilter">
+              <option value="pending_review" selected>待处理</option>
+              <option value="accepted">已批准（含修改后接受）</option>
               <option value="all">全部决定</option>
-              <option value="pending_review">待处理</option>
-              <option value="approved">已批准</option>
+              <option value="approved">直接批准</option>
               <option value="modified">修改后接受</option>
               <option value="rejected">已拒绝</option>
             </select>
@@ -216,6 +217,7 @@
         <div class="list-meta">
           <span id="ruleCountText">正在读取候选规则…</span>
           <div>
+            <button class="text-button approved-rules-toggle" id="approvedRulesToggle" type="button" aria-pressed="false">查看已批准规则</button>
             <button class="text-button" id="approveVisibleButton" type="button">批准当前筛选中的待处理项</button>
             <button class="text-button" id="clearFiltersButton" type="button">清除筛选</button>
           </div>

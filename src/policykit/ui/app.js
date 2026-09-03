@@ -44,6 +44,7 @@ const dom = {};
 
 document.addEventListener("DOMContentLoaded", () => {
   cacheDom();
+  dom.decisionFilter.value = "pending_review";
   bindEvents();
   renderSkeletons();
   refreshAll();
@@ -56,7 +57,7 @@ function cacheDom() {
     "statVersion", "statIndexHint", "documentScope", "dropZone", "fileInput",
     "chooseFilesButton", "fileQueue", "fileQueueEmpty", "fileSummary", "importButton",
     "prepareButton", "approveAllButton", "ruleSearch", "decisionFilter", "severityFilter", "scopeFilter",
-    "categoryFilter", "clearFiltersButton", "approveVisibleButton", "ruleCountText", "ruleList", "activationApproved",
+    "categoryFilter", "clearFiltersButton", "approvedRulesToggle", "approveVisibleButton", "ruleCountText", "ruleList", "activationApproved",
     "activationPending", "activationRejected", "activationForm", "policyVersion", "activateButton", "searchForm",
     "searchQuery", "searchFile", "searchCode", "searchScopes", "searchCategories",
     "searchLimit", "searchButton", "searchResultCount", "searchIndexBadge", "searchResults",
@@ -104,6 +105,7 @@ function bindEvents() {
   [dom.ruleSearch, dom.decisionFilter, dom.severityFilter, dom.scopeFilter, dom.categoryFilter]
     .forEach((element) => element.addEventListener("input", renderRules));
   dom.clearFiltersButton.addEventListener("click", clearRuleFilters);
+  dom.approvedRulesToggle.addEventListener("click", toggleApprovedRules);
   dom.approveVisibleButton.addEventListener("click", approveVisibleRules);
 
   dom.activationForm.addEventListener("submit", activateRules);
@@ -418,12 +420,24 @@ function initializeDrafts() {
 function renderRules() {
   dom.ruleList.setAttribute("aria-busy", "false");
   const filtered = filteredRules();
+  const counts = countDecisionsFromDrafts();
+  const acceptedCount = counts.approved + counts.modified;
+  const decision = dom.decisionFilter.value;
   dom.ruleList.replaceChildren();
-  dom.ruleCountText.textContent = "显示 " + filtered.length + " / " + state.rules.length + " 条候选规则";
+  if (decision === "pending_review") {
+    dom.ruleCountText.textContent = counts.pending_review
+      ? "显示 " + filtered.length + " / " + counts.pending_review + " 条待处理规则；已批准规则已收起"
+      : "待处理规则已全部完成；" + acceptedCount + " 条已批准规则已收起";
+  } else if (decision === "accepted") {
+    dom.ruleCountText.textContent = "显示 " + filtered.length + " / " + acceptedCount + " 条已批准规则";
+  } else {
+    dom.ruleCountText.textContent = "显示 " + filtered.length + " / " + state.rules.length + " 条候选规则";
+  }
   dom.approveVisibleButton.disabled = !filtered.some((rule) => {
     const draft = state.drafts.get(rule.id);
     return draft && draft.decision === "pending_review" && !draft.dirty;
   });
+  updateApprovedRulesToggle(counts);
   updateApproveAllButton();
 
   if (!state.rules.length) {
@@ -433,7 +447,19 @@ function renderRules() {
     return;
   }
   if (!filtered.length) {
-    dom.ruleList.append(emptyState("没有符合筛选条件的规则", "清除部分筛选条件后重试。", "⌕"));
+    if (decision === "pending_review" && counts.pending_review === 0) {
+      dom.ruleList.append(emptyState(
+        "待处理规则已全部完成",
+        acceptedCount
+          ? "已批准规则默认收起；点击上方“查看已批准规则”即可查看。"
+          : "当前没有需要审批的候选规则。",
+        "✓",
+      ));
+    } else if (decision === "accepted" && acceptedCount === 0) {
+      dom.ruleList.append(emptyState("还没有已批准规则", "先完成候选规则审批。", "◇"));
+    } else {
+      dom.ruleList.append(emptyState("没有符合筛选条件的规则", "清除部分筛选条件后重试。", "⌕"));
+    }
     return;
   }
 
@@ -442,6 +468,16 @@ function renderRules() {
   dom.ruleList.append(fragment);
   renderActivationSummary();
   renderStatus();
+}
+
+function updateApprovedRulesToggle(counts = countDecisionsFromDrafts()) {
+  const acceptedCount = counts.approved + counts.modified;
+  const showingApproved = dom.decisionFilter.value === "accepted";
+  dom.approvedRulesToggle.disabled = !showingApproved && acceptedCount === 0;
+  dom.approvedRulesToggle.textContent = showingApproved
+    ? "收起已批准规则"
+    : "查看已批准规则（" + acceptedCount + "）";
+  dom.approvedRulesToggle.setAttribute("aria-pressed", String(showingApproved));
 }
 
 function updateApproveAllButton() {
@@ -707,6 +743,7 @@ function createReviewEditor(rule, draft, card, stateLabel) {
       saveState.classList.remove("is-dirty");
       toast("决定已保存", rule.id + " · " + DECISIONS[draft.decision], "success");
       await Promise.all([loadStatus(), loadRawReview()]);
+      renderRules();
     } catch (error) {
       const staleReview = error.status === 409 && error.code === "stale_review";
       const staleDecision = error.status === 409 && error.code === "stale_decision";
@@ -752,17 +789,30 @@ function filteredRules() {
       metadata.positive_example, metadata.retrieval_intent,
       ...arrayOf(metadata.aliases), ...arrayOf(metadata.code_signals),
     ].filter(Boolean).join(" ").toLocaleLowerCase("zh-CN");
+    const matchesDecision = decision === "all"
+      || (decision === "accepted" && draft && ["approved", "modified"].includes(draft.decision))
+      || (draft && draft.decision === decision);
     return (!query || haystack.includes(query))
-      && (decision === "all" || (draft && draft.decision === decision))
+      && matchesDecision
       && (severity === "all" || normalizeToken(rule.severity) === severity)
       && (scope === "all" || normalizeToken(rule.scope, "unknown") === scope)
       && (!category || firstText(rule.category).toLocaleLowerCase("zh-CN").includes(category));
   });
 }
 
+function toggleApprovedRules() {
+  const showingApproved = dom.decisionFilter.value === "accepted";
+  dom.ruleSearch.value = "";
+  dom.decisionFilter.value = showingApproved ? "pending_review" : "accepted";
+  dom.severityFilter.value = "all";
+  dom.scopeFilter.value = "all";
+  dom.categoryFilter.value = "";
+  renderRules();
+}
+
 function clearRuleFilters() {
   dom.ruleSearch.value = "";
-  dom.decisionFilter.value = "all";
+  dom.decisionFilter.value = "pending_review";
   dom.severityFilter.value = "all";
   dom.scopeFilter.value = "all";
   dom.categoryFilter.value = "";
