@@ -88,6 +88,9 @@ def _structured_details(rule: PolicyRule) -> list[str]:
     if not metadata.get("structured_format"):
         return []
     lines = ["### 结构化规则详情", ""]
+    original_rule_id = str(metadata.get("original_rule_id") or "").strip()
+    if original_rule_id and original_rule_id != rule.id:
+        lines.extend([f"- 文档原始 ID：`{original_rule_id}`", ""])
     level = str(metadata.get("level") or "未标注").strip()
     lines.extend([f"- 级别：`{level}`", ""])
     for key, label in (

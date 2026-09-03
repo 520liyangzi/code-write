@@ -377,6 +377,99 @@ class PolicyStudioTests(unittest.TestCase):
             )
         self.assertEqual("decision_not_pending", captured.exception.code)
 
+    def test_one_request_can_approve_three_hundred_pending_rules(self) -> None:
+        sections = []
+        for index in range(300):
+            sections.append(
+                f"### 1.{index + 1} G.BULK.{index + 1:03d} 必须遵循批量规则 {index + 1}\n\n"
+                "**【级别】** 要求\n\n"
+                f"**【描述】** 创建第 {index + 1} 项时必须记录审计信息。\n"
+            )
+        imported = self.studio.import_documents(
+            {
+                "scope": "company",
+                "files": [
+                    {"name": "三百条规则.md", "content": "\n".join(sections)}
+                ],
+            }
+        )
+        self.assertEqual(1, imported["imported_count"])
+        prepared = self.studio.prepare({})
+        self.assertEqual(300, prepared["candidate_count"])
+        rules = self.studio.review()["rules"]
+        result = self.studio.approve_rules(
+            {
+                "rules": [
+                    {
+                        "rule_id": rule["id"],
+                        "review_hash": rule["review_hash"],
+                        "decision_hash": rule["decision_hash"],
+                    }
+                    for rule in rules
+                ]
+            }
+        )
+        self.assertEqual(300, result["approved_count"])
+        decisions = self.studio.review()["decision_counts"]
+        self.assertEqual({"approved": 300}, decisions)
+
+    def test_prepare_namespaces_duplicate_rule_ids_by_document(self) -> None:
+        document = (
+            "### 1.1 G.DUP.01 必须记录操作日志\n\n"
+            "**【级别】** 要求\n\n"
+            "**【描述】** 每次关键操作都必须记录审计日志。\n"
+        )
+        self.studio.import_documents(
+            {
+                "scope": "company",
+                "files": [
+                    {"name": "文档甲.md", "content": document},
+                    {"name": "文档乙.md", "content": document},
+                ],
+            }
+        )
+        prepared = self.studio.prepare({})
+        self.assertEqual(2, prepared["candidate_count"])
+        rules = self.studio.review()["rules"]
+        self.assertEqual(
+            {"文档甲::G.DUP.01", "文档乙::G.DUP.01"},
+            {rule["id"] for rule in rules},
+        )
+        self.assertTrue(
+            all(rule["metadata"]["original_rule_id"] == "G.DUP.01" for rule in rules)
+        )
+        self.assertTrue(
+            all(rule["source"]["document"].endswith(".md") for rule in rules)
+        )
+        approved = self.studio.approve_rules(
+            {
+                "rules": [
+                    {
+                        "rule_id": rule["id"],
+                        "review_hash": rule["review_hash"],
+                        "decision_hash": rule["decision_hash"],
+                    }
+                    for rule in rules
+                ]
+            }
+        )
+        self.assertEqual(2, approved["approved_count"])
+        self.studio.activate({"policy_version": "duplicate-id-v1"})
+        results = self.studio.search(
+            {"query": "G.DUP.01", "file": "", "code": "", "limit": 10}
+        )
+        self.assertEqual(2, results["result_count"])
+        self.assertEqual(
+            {"文档甲::G.DUP.01", "文档乙::G.DUP.01"},
+            {result["id"] for result in results["results"]},
+        )
+        self.assertTrue(
+            all(
+                any("原始规则 ID" in reason for reason in result["reasons"])
+                for result in results["results"]
+            )
+        )
+
     def test_activate_and_search_use_sqlite_index_only(self) -> None:
         self.approve_rule()
         activated = self.studio.activate({"policy_version": "studio-test-v1"})

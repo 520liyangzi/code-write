@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 import re
 import unicodedata
@@ -141,6 +142,8 @@ _CHANGE_SET_RE = re.compile(
     r"(?:新增|创建|修改|更新|删除).{0,16}(?:同时|同步|一并|配套|对应)",
     re.IGNORECASE,
 )
+
+_MAX_QUALIFIED_RULE_ID_CHARS = 240
 
 
 @dataclass(slots=True)
@@ -778,6 +781,130 @@ class MarkdownPolicyExtractor:
         return rules
 
 
+def _document_id_namespace(document: str) -> str:
+    """Return a readable, stable namespace derived from a source filename."""
+
+    normalized = unicodedata.normalize("NFKC", str(document or "document"))
+    filename = normalized.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    namespace = re.sub(r"[^\w.-]+", "-", stem, flags=re.UNICODE).strip("-._")
+    return (namespace or "document")[:96]
+
+
+def _qualified_rule_id(namespace: str, original_id: str) -> str:
+    candidate = f"{namespace}::{original_id}"
+    if len(candidate) <= _MAX_QUALIFIED_RULE_ID_CHARS:
+        return candidate
+    digest = sha256(candidate.encode("utf-8")).hexdigest()[:10]
+    original = original_id[:120]
+    available = max(
+        12,
+        _MAX_QUALIFIED_RULE_ID_CHARS - len(original) - len(digest) - 3,
+    )
+    return f"{namespace[:available]}-{digest}::{original}"
+
+
+def qualify_duplicate_rule_ids(rules: Iterable[PolicyRule]) -> list[PolicyRule]:
+    """Namespace only cross-document ID collisions by source filename.
+
+    Published standards frequently restart IDs in separate documents. The
+    original ID remains searchable metadata, while the internal ID becomes a
+    stable ``filename::original-id`` key suitable for review maps and SQLite.
+    Rules whose IDs are already unique remain unchanged, preserving existing
+    approvals and external references.
+    """
+
+    selected = list(rules)
+    groups: dict[str, list[PolicyRule]] = {}
+    for rule in selected:
+        groups.setdefault(
+            unicodedata.normalize("NFKC", rule.id).casefold(), []
+        ).append(rule)
+
+    occupied = {
+        unicodedata.normalize("NFKC", group[0].id).casefold()
+        for group in groups.values()
+        if len(group) == 1
+    }
+    collision_groups = sorted(
+        (group for group in groups.values() if len(group) > 1),
+        key=lambda group: unicodedata.normalize("NFKC", group[0].id).casefold(),
+    )
+    for group in collision_groups:
+        entries: list[tuple[PolicyRule, str, str]] = []
+        candidate_counts: dict[str, int] = {}
+        for rule in group:
+            namespace = _document_id_namespace(rule.source.document)
+            candidate = _qualified_rule_id(namespace, rule.id)
+            folded = unicodedata.normalize("NFKC", candidate).casefold()
+            candidate_counts[folded] = candidate_counts.get(folded, 0) + 1
+            entries.append((rule, namespace, candidate))
+
+        entries.sort(
+            key=lambda item: (
+                unicodedata.normalize("NFKC", item[0].source.document).casefold(),
+                item[0].source.line_start,
+                item[0].source.section.casefold(),
+                item[0].statement.casefold(),
+            )
+        )
+        for rule, namespace, candidate in entries:
+            original_id = rule.id
+            folded = unicodedata.normalize("NFKC", candidate).casefold()
+            if candidate_counts[folded] > 1 or folded in occupied:
+                document_key = unicodedata.normalize(
+                    "NFKC", rule.source.document
+                ).casefold()
+                document_digest = sha256(document_key.encode("utf-8")).hexdigest()[:8]
+                namespace = f"{namespace}-{document_digest}"
+                candidate = _qualified_rule_id(namespace, original_id)
+                folded = unicodedata.normalize("NFKC", candidate).casefold()
+            if folded in occupied:
+                rule_key = "\0".join(
+                    (
+                        rule.source.document,
+                        rule.source.section,
+                        str(rule.source.line_start),
+                        rule.statement,
+                    )
+                )
+                rule_digest = sha256(rule_key.encode("utf-8")).hexdigest()[:10]
+                namespace = (
+                    f"{_document_id_namespace(rule.source.document)}-{rule_digest}"
+                )
+                candidate = _qualified_rule_id(namespace, original_id)
+                folded = unicodedata.normalize("NFKC", candidate).casefold()
+            suffix = 2
+            unique_candidate = candidate
+            while folded in occupied:
+                unique_candidate = _qualified_rule_id(
+                    f"{namespace}-{suffix}", original_id
+                )
+                folded = unicodedata.normalize("NFKC", unique_candidate).casefold()
+                suffix += 1
+
+            metadata = dict(rule.metadata or {})
+            metadata.update(
+                {
+                    "original_rule_id": original_id,
+                    "id_namespace": namespace,
+                    "id_collision_resolved": True,
+                }
+            )
+            rule.id = unique_candidate
+            rule.metadata = metadata
+            rule.trigger_terms = tuple(
+                dict.fromkeys((*rule.trigger_terms, original_id))
+            )
+            rule.tags = tuple(
+                dict.fromkeys(
+                    (*rule.tags, original_id, namespace, "document-namespaced-id")
+                )
+            )
+            occupied.add(folded)
+    return selected
+
+
 def extract_markdown(
     markdown: str,
     source_name: str = "policy.md",
@@ -854,7 +981,7 @@ def extract_files(
                     file_scope = scopes[key]
                     break
         rules.extend(extract_file(path, scope=file_scope, id_prefix=id_prefix))
-    return rules
+    return qualify_duplicate_rule_ids(rules)
 
 
 __all__ = [
@@ -862,5 +989,6 @@ __all__ = [
     "extract_file",
     "extract_files",
     "extract_markdown",
+    "qualify_duplicate_rule_ids",
     "read_markdown",
 ]

@@ -141,6 +141,8 @@ class PolicyRule:
         metadata = self.metadata or {}
         metadata_parts: list[str] = []
         for key in (
+            "original_rule_id",
+            "id_namespace",
             "level",
             "description",
             "negative_example",

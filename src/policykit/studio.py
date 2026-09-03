@@ -36,7 +36,7 @@ from .checkers import PolicyChecker, validate_checker_rules
 from .compiler import write_global_block
 from .config import ensure_layout, resolve_path
 from .database import PolicyDatabaseError, database_status, sync_database_bundle
-from .extractor import extract_file
+from .extractor import extract_file, qualify_duplicate_rule_ids
 from .io_utils import utc_now, write_text
 from .model import PolicyRule, ReviewDecision
 from .review import (
@@ -622,6 +622,7 @@ class PolicyStudio:
                         source_name=document["relative_path"],
                     )
                 )
+            rules = qualify_duplicate_rule_ids(rules)
 
             warnings: list[str] = []
             ai_settings = AISettings.from_config(self.config)

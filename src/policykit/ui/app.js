@@ -55,7 +55,7 @@ function cacheDom() {
     "dismissError", "statCandidates", "statCandidatesHint", "statApproved", "statPending",
     "statVersion", "statIndexHint", "documentScope", "dropZone", "fileInput",
     "chooseFilesButton", "fileQueue", "fileQueueEmpty", "fileSummary", "importButton",
-    "prepareButton", "ruleSearch", "decisionFilter", "severityFilter", "scopeFilter",
+    "prepareButton", "approveAllButton", "ruleSearch", "decisionFilter", "severityFilter", "scopeFilter",
     "categoryFilter", "clearFiltersButton", "approveVisibleButton", "ruleCountText", "ruleList", "activationApproved",
     "activationPending", "activationRejected", "activationForm", "policyVersion", "activateButton", "searchForm",
     "searchQuery", "searchFile", "searchCode", "searchScopes", "searchCategories",
@@ -99,6 +99,7 @@ function bindEvents() {
   dom.dropZone.addEventListener("drop", (event) => addFiles(event.dataTransfer.files));
   dom.importButton.addEventListener("click", importDocuments);
   dom.prepareButton.addEventListener("click", prepareCandidates);
+  dom.approveAllButton.addEventListener("click", approveAllPendingRules);
 
   [dom.ruleSearch, dom.decisionFilter, dom.severityFilter, dom.scopeFilter, dom.categoryFilter]
     .forEach((element) => element.addEventListener("input", renderRules));
@@ -423,6 +424,7 @@ function renderRules() {
     const draft = state.drafts.get(rule.id);
     return draft && draft.decision === "pending_review" && !draft.dirty;
   });
+  updateApproveAllButton();
 
   if (!state.rules.length) {
     dom.ruleList.append(emptyState("尚无候选规则", "先导入 Markdown，再点击“生成候选规则”。", "◇"));
@@ -440,6 +442,17 @@ function renderRules() {
   dom.ruleList.append(fragment);
   renderActivationSummary();
   renderStatus();
+}
+
+function updateApproveAllButton() {
+  const pendingCount = state.rules.filter((rule) => {
+    const draft = state.drafts.get(rule.id);
+    return draft && draft.decision === "pending_review";
+  }).length;
+  dom.approveAllButton.disabled = pendingCount === 0;
+  dom.approveAllButton.textContent = pendingCount
+    ? "一键批准全部待处理（" + pendingCount + "）"
+    : "全部待处理已完成";
 }
 
 function createRuleCard(rule) {
@@ -464,6 +477,10 @@ function createRuleCard(rule) {
   badges.append(badge(severity.toUpperCase(), "badge-" + severity));
   badges.append(badge(scopeLabel(rule.scope)));
   badges.append(badge(firstText(rule.category, "未分类")));
+  const metadata = objectOrEmpty(rule.metadata);
+  if (metadata.original_rule_id && metadata.original_rule_id !== rule.id) {
+    badges.append(badge("原 ID " + metadata.original_rule_id));
+  }
   const confidence = normalizeConfidence(rule.confidence);
   if (confidence !== null) badges.append(badge("置信度 " + Math.round(confidence * 100) + "%"));
   checkerLabels(rule).forEach((label) => badges.append(badge(label, "badge-checker")));
@@ -552,6 +569,56 @@ async function approveVisibleRules() {
   }
 }
 
+async function approveAllPendingRules() {
+  const dirty = Array.from(state.drafts.values()).filter((draft) => draft.dirty).length;
+  if (dirty) {
+    toast(
+      "仍有未保存决定",
+      "请先保存 " + dirty + " 条规则的决定，再执行全部批准。",
+      "warning",
+    );
+    return;
+  }
+  const rules = state.rules.filter((rule) => {
+    const draft = state.drafts.get(rule.id);
+    return draft && draft.decision === "pending_review";
+  });
+  if (!rules.length) {
+    toast("没有待处理规则", "当前全部候选都已经处理。", "warning");
+    return;
+  }
+  const documents = new Set(
+    rules.map((rule) => firstText(rule.source && rule.source.document, "未知文档")),
+  );
+  const confirmed = window.confirm(
+    "确认一次批准全部 " + rules.length + " 条待处理规则吗？\n\n"
+    + "涉及 " + documents.size + " 份文档。该操作不会修改已批准、已拒绝或修改后接受的规则。\n"
+    + "建议至少抽查每份文档的规则结构、级别和正反例。",
+  );
+  if (!confirmed) return;
+  setButtonBusy(dom.approveAllButton, true);
+  try {
+    await request(API.approve, {
+      method: "POST",
+      body: {
+        rules: rules.map((rule) => ({
+          rule_id: rule.id,
+          review_hash: rule.review_hash,
+          decision_hash: rule.decision_hash,
+        })),
+      },
+    });
+    await Promise.all([loadStatus(), loadReview(), loadRawReview()]);
+    toast("全部批准完成", "已一次批准 " + rules.length + " 条待处理规则。", "success");
+  } catch (error) {
+    showPageError(errorMessage(error));
+    toast("全部批准失败", errorMessage(error), "error");
+  } finally {
+    setButtonBusy(dom.approveAllButton, false);
+    updateApproveAllButton();
+  }
+}
+
 function createReviewEditor(rule, draft, card, stateLabel) {
   const editor = element("div", "review-editor");
   const group = element("div", "decision-group");
@@ -575,6 +642,7 @@ function createReviewEditor(rule, draft, card, stateLabel) {
       saveState.textContent = "有未保存的决定";
       saveState.classList.add("is-dirty");
       renderActivationSummary();
+      updateApproveAllButton();
     });
     group.append(button);
   });

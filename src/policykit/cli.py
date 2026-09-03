@@ -28,7 +28,7 @@ from .config import (
 )
 from .diagnostics import render_doctor, run_doctor
 from .database import PolicyDatabaseError, sync_database_bundle
-from .extractor import extract_file
+from .extractor import extract_file, qualify_duplicate_rule_ids
 from .hooks import main_hook, prepare_receipt
 from .io_utils import utc_now
 from .model import PolicyRule
@@ -129,6 +129,7 @@ def command_prepare(args: argparse.Namespace) -> int:
                 source_name=source_name,
             )
         )
+    rules = qualify_duplicate_rule_ids(rules)
     candidates_path = resolve_path(home, config, "candidates")
     review_path = resolve_path(home, config, "review")
     previous_candidates = (
@@ -528,6 +529,7 @@ def command_search(args: argparse.Namespace) -> int:
         )
         metadata = rule.get("metadata") if isinstance(rule.get("metadata"), dict) else {}
         for key, label in (
+            ("original_rule_id", "原始规则 ID"),
             ("level", "级别"),
             ("description", "描述"),
             ("negative_example", "反例"),

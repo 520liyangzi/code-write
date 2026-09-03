@@ -304,12 +304,30 @@ def _score_results(
             )
 
         reasons: list[str] = []
-        rule_id_folded = rule.id.casefold()
-        if normalized_query and (
-            normalized_query == rule_id_folded or rule_id_folded in normalized_query
-        ):
+        original_rule_id = str(
+            (rule.metadata or {}).get("original_rule_id") or ""
+        ).strip()
+        id_candidates = tuple(
+            dict.fromkeys(
+                value for value in (rule.id, original_rule_id) if value
+            )
+        )
+        matched_id = next(
+            (
+                value
+                for value in id_candidates
+                if normalized_query
+                and (
+                    normalized_query == value.casefold()
+                    or value.casefold() in normalized_query
+                )
+            ),
+            "",
+        )
+        if matched_id:
             score += 12.0
-            reasons.append(f"命中规则 ID：{rule.id}")
+            label = "文档原始规则 ID" if matched_id != rule.id else "规则 ID"
+            reasons.append(f"命中{label}：{matched_id}")
 
         query_matches = [term for term in query_tokens if term in frequencies]
         path_matches = [term for term in path_tokens if term in frequencies]

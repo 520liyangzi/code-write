@@ -128,10 +128,15 @@
             <p class="section-kicker">IMPORT &amp; ADMISSION</p>
             <h2 id="reviewTitle">导入规范并审阅候选</h2>
           </div>
-          <button class="button button-primary" id="prepareButton" type="button">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"></path></svg>
-            生成候选规则
-          </button>
+          <div class="section-heading-actions">
+            <button class="button button-secondary" id="approveAllButton" type="button" disabled>
+              一键批准全部待处理
+            </button>
+            <button class="button button-primary" id="prepareButton" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 19h14"></path></svg>
+              生成候选规则
+            </button>
+          </div>
         </div>
 
         <div class="import-panel">
@@ -211,7 +216,7 @@
         <div class="list-meta">
           <span id="ruleCountText">正在读取候选规则…</span>
           <div>
-            <button class="text-button" id="approveVisibleButton" type="button">批量批准当前待处理项</button>
+            <button class="text-button" id="approveVisibleButton" type="button">批准当前筛选中的待处理项</button>
             <button class="text-button" id="clearFiltersButton" type="button">清除筛选</button>
           </div>
         </div>

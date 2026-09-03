@@ -117,6 +117,39 @@ class CliEndToEndTests(unittest.TestCase):
                 "approved", read_review_decisions(review)[0].decision
             )
 
+    def test_prepare_namespaces_duplicate_ids_across_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.run_cli("--home", str(home), "init")
+            source_root = home / "policy-sources" / "company"
+            document = (
+                "### 1.1 G.DUP.01 必须记录日志\n\n"
+                "**【级别】** 要求\n\n"
+                "**【描述】** 关键操作必须记录完整日志。\n"
+            )
+            (source_root / "安全规范.md").write_text(document, encoding="utf-8")
+            (source_root / "审计规范.md").write_text(document, encoding="utf-8")
+
+            status, output, error = self.run_cli("--home", str(home), "prepare")
+            self.assertEqual(0, status, error)
+            self.assertIn("提取到 2 条候选规则", output)
+            payload = json.loads(
+                (home / ".policy-work" / "candidates.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                {"安全规范::G.DUP.01", "审计规范::G.DUP.01"},
+                {rule["id"] for rule in payload["rules"]},
+            )
+            self.assertEqual(
+                {"G.DUP.01"},
+                {
+                    rule["metadata"]["original_rule_id"]
+                    for rule in payload["rules"]
+                },
+            )
+
     def test_review_rejects_invalid_checker_draft(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

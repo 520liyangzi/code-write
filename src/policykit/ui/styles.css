@@ -457,6 +457,13 @@ summary:focus-visible {
   letter-spacing: -.015em;
 }
 
+.section-heading-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
 .section-description {
   max-width: 520px;
   margin: 5px 0 0;
@@ -1709,6 +1716,11 @@ textarea:focus {
     align-items: stretch;
     flex-direction: column;
     gap: 10px;
+  }
+
+  .section-heading-actions {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .section-description {
